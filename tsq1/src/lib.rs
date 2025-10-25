@@ -235,6 +235,14 @@ pub mod ffi {
         if midi_ptr.is_null() || out.is_null() {
             return Tsq1Status::NullPointer;
         }
+        ptr::write(
+            out,
+            Tsq1Buffer {
+                ptr: ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            },
+        );
         let midi = slice::from_raw_parts(midi_ptr, midi_len);
         match super::convert_midi_to_tsq_vec(midi) {
             Ok(mut data) => {
