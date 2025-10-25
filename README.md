@@ -20,4 +20,4 @@ This specification inherits the advantages of **SMF (Standard MIDI File)** (musi
 
 ---
 
-see detail to [TSQ1_SPEC_v1.0.md](TSQ1_SPEC_v1.0.md) for English version or [TSQ1_SPEC_v1.0_JP.md](TSQ1_SPEC_v1.0_JP.md) for 日本語 version.
+see detail to [TSQ1_SPEC_v1.0_Draft.md](TSQ1_SPEC_v1.0_Draft.md) for English version or [TSQ1_SPEC_v1.0_JP_Draft.md](TSQ1_SPEC_v1.0_JP_Draft.md) for 日本語 version.
