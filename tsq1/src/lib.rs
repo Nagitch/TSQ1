@@ -192,34 +192,57 @@ fn parse_midi_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
     if !(0x80..=0xEF).contains(&status) {
         return Err(Error::Invalid("invalid MIDI status byte"));
     }
-    let data1 = read_u8(data)?;
-    let data2 = read_u8(data)?;
-
     let channel = u4::try_from(status & 0x0F).ok_or(Error::Invalid("invalid MIDI channel"))?;
-    let message = match status >> 4 {
-        0x8 => MidiMessage::NoteOff {
-            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
-            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
-        },
-        0x9 => MidiMessage::NoteOn {
-            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
-            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
-        },
-        0xA => MidiMessage::Aftertouch {
-            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
-            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
-        },
-        0xB => MidiMessage::Controller {
-            controller: u7::try_from(data1).ok_or(Error::Invalid("controller out of range"))?,
-            value: u7::try_from(data2).ok_or(Error::Invalid("controller value out of range"))?,
-        },
-        0xC => MidiMessage::ProgramChange {
-            program: u7::try_from(data1).ok_or(Error::Invalid("program out of range"))?,
-        },
-        0xD => MidiMessage::ChannelAftertouch {
-            vel: u7::try_from(data1).ok_or(Error::Invalid("aftertouch velocity out of range"))?,
-        },
+    let high_nibble = status >> 4;
+    let message = match high_nibble {
+        0x8 => {
+            let data1 = read_u8(data)?;
+            let data2 = read_u8(data)?;
+            MidiMessage::NoteOff {
+                key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+                vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+            }
+        }
+        0x9 => {
+            let data1 = read_u8(data)?;
+            let data2 = read_u8(data)?;
+            MidiMessage::NoteOn {
+                key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+                vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+            }
+        }
+        0xA => {
+            let data1 = read_u8(data)?;
+            let data2 = read_u8(data)?;
+            MidiMessage::Aftertouch {
+                key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+                vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+            }
+        }
+        0xB => {
+            let data1 = read_u8(data)?;
+            let data2 = read_u8(data)?;
+            MidiMessage::Controller {
+                controller: u7::try_from(data1).ok_or(Error::Invalid("controller out of range"))?,
+                value: u7::try_from(data2).ok_or(Error::Invalid("controller value out of range"))?,
+            }
+        }
+        0xC => {
+            let program = read_u8(data)?;
+            MidiMessage::ProgramChange {
+                program: u7::try_from(program).ok_or(Error::Invalid("program out of range"))?,
+            }
+        }
+        0xD => {
+            let vel = read_u8(data)?;
+            MidiMessage::ChannelAftertouch {
+                vel: u7::try_from(vel)
+                    .ok_or(Error::Invalid("aftertouch velocity out of range"))?,
+            }
+        }
         0xE => {
+            let data1 = read_u8(data)?;
+            let data2 = read_u8(data)?;
             let lsb = u7::try_from(data1).ok_or(Error::Invalid("pitch bend LSB out of range"))?;
             let msb = u7::try_from(data2).ok_or(Error::Invalid("pitch bend MSB out of range"))?;
             let raw = ((msb.as_int() as u16) << 7) | lsb.as_int() as u16;
@@ -397,7 +420,9 @@ fn encode_event(delta: u64, kind: &TrackEventKind<'_>, out: &mut Vec<u8>) -> Res
             let (data1, data2) = midi_message_bytes(message);
             out.push(status);
             out.push(data1);
-            out.push(data2);
+            if let Some(d2) = data2 {
+                out.push(d2);
+            }
         }
         TrackEventKind::SysEx(data) | TrackEventKind::Escape(data) => {
             out.push(DOMAIN_MUSICAL | 0x03);
@@ -430,17 +455,19 @@ fn midi_status_byte(channel: u4, message: &MidiMessage) -> u8 {
     (nibble << 4) | channel.as_int()
 }
 
-fn midi_message_bytes(message: &MidiMessage) -> (u8, u8) {
+fn midi_message_bytes(message: &MidiMessage) -> (u8, Option<u8>) {
     match message {
         MidiMessage::NoteOff { key, vel }
         | MidiMessage::NoteOn { key, vel }
-        | MidiMessage::Aftertouch { key, vel } => (key.as_int(), vel.as_int()),
-        MidiMessage::Controller { controller, value } => (controller.as_int(), value.as_int()),
-        MidiMessage::ProgramChange { program } => (program.as_int(), 0),
-        MidiMessage::ChannelAftertouch { vel } => (vel.as_int(), 0),
+        | MidiMessage::Aftertouch { key, vel } => (key.as_int(), Some(vel.as_int())),
+        MidiMessage::Controller { controller, value } => {
+            (controller.as_int(), Some(value.as_int()))
+        }
+        MidiMessage::ProgramChange { program } => (program.as_int(), None),
+        MidiMessage::ChannelAftertouch { vel } => (vel.as_int(), None),
         MidiMessage::PitchBend { bend } => {
             let raw = bend.0.as_int();
-            ((raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8)
+            ((raw & 0x7F) as u8, Some(((raw >> 7) & 0x7F) as u8))
         }
     }
 }
@@ -586,5 +613,159 @@ mod tests {
         data.clear();
         write_vlq(0x80, &mut data);
         assert_eq!(data, vec![0x81, 0x00]);
+    }
+
+    fn build_tsq_track(events: &[TrackEventKind<'_>], deltas: &[u64]) -> Vec<u8> {
+        assert_eq!(events.len(), deltas.len());
+        let mut track = Vec::new();
+        for (event, delta) in events.iter().zip(deltas.iter()) {
+            encode_event(*delta, event, &mut track).expect("encode_event should succeed");
+        }
+        track
+    }
+
+    fn tsq_with_single_track(track_data: &[u8], ppq: u16) -> Vec<u8> {
+        let mut tsq = Vec::new();
+        write_header(&mut tsq, ppq, 1);
+        tsq.extend_from_slice(b"TRK ");
+        tsq.extend_from_slice(&(track_data.len() as u32).to_le_bytes());
+        tsq.extend_from_slice(track_data);
+        tsq
+    }
+
+    #[test]
+    fn converts_simple_note_sequence_to_midi() {
+        let channel = u4::try_from(0).unwrap();
+        let key = u7::try_from(60).unwrap();
+        let velocity = u7::try_from(100).unwrap();
+
+        let events = [
+            TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::NoteOn {
+                    key,
+                    vel: velocity,
+                },
+            },
+            TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::NoteOff {
+                    key,
+                    vel: velocity,
+                },
+            },
+            TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        ];
+        let deltas = [0, 480, 0];
+        let track = build_tsq_track(&events, &deltas);
+        let tsq = tsq_with_single_track(&track, 480);
+
+        let midi = convert_tsq_to_midi_vec(&tsq).expect("conversion succeeds");
+        let smf = Smf::parse(&midi).expect("generated MIDI parses");
+
+        assert_eq!(smf.tracks.len(), 1);
+        match smf.header.timing {
+            Timing::Metrical(ppq) => assert_eq!(ppq.as_int(), 480),
+            _ => panic!("expected metrical timing"),
+        }
+        assert_eq!(smf.header.format, Format::SingleTrack);
+
+        let track = &smf.tracks[0];
+        assert_eq!(track.len(), 3);
+        assert_eq!(track[0].delta.as_int(), 0);
+        assert_eq!(track[1].delta.as_int(), 480);
+        assert_eq!(track[2].delta.as_int(), 0);
+
+        match &track[0].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 0);
+                match message {
+                    MidiMessage::NoteOn { key: k, vel: v } => {
+                        assert_eq!(k.as_int(), 60);
+                        assert_eq!(v.as_int(), 100);
+                    }
+                    _ => panic!("expected note on"),
+                }
+            }
+            _ => panic!("expected MIDI event"),
+        }
+
+        match &track[1].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 0);
+                match message {
+                    MidiMessage::NoteOff { key: k, vel: v } => {
+                        assert_eq!(k.as_int(), 60);
+                        assert_eq!(v.as_int(), 100);
+                    }
+                    _ => panic!("expected note off"),
+                }
+            }
+            _ => panic!("expected MIDI event"),
+        }
+
+        assert!(matches!(
+            &track[2].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+    }
+
+    #[test]
+    fn parses_single_byte_midi_events() {
+        let channel = u4::try_from(2).unwrap();
+        let program = u7::try_from(12).unwrap();
+        let aftertouch = u7::try_from(55).unwrap();
+
+        let events = [
+            TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::ProgramChange { program },
+            },
+            TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::ChannelAftertouch { vel: aftertouch },
+            },
+            TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        ];
+        let deltas = [0, 12, 0];
+        let track = build_tsq_track(&events, &deltas);
+        let tsq = tsq_with_single_track(&track, 960);
+
+        let smf = super::convert_tsq_to_smf(&tsq).expect("conversion succeeds");
+        assert_eq!(smf.tracks.len(), 1);
+        let track = &smf.tracks[0];
+        assert_eq!(track.len(), 3);
+
+        match &track[0].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 2);
+                match message {
+                    MidiMessage::ProgramChange { program: p } => {
+                        assert_eq!(p.as_int(), 12);
+                    }
+                    _ => panic!("expected program change"),
+                }
+            }
+            _ => panic!("expected MIDI event"),
+        }
+
+        assert_eq!(track[1].delta.as_int(), 12);
+        match &track[1].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 2);
+                match message {
+                    MidiMessage::ChannelAftertouch { vel } => {
+                        assert_eq!(vel.as_int(), 55);
+                    }
+                    _ => panic!("expected channel aftertouch"),
+                }
+            }
+            _ => panic!("expected MIDI event"),
+        }
+
+        match &track[2].kind {
+            TrackEventKind::Meta(MetaMessage::EndOfTrack) => {}
+            _ => panic!("expected end of track"),
+        }
     }
 }
