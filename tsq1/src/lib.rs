@@ -61,6 +61,8 @@ pub fn convert_tsq_to_midi_vec(tsq_data: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+const FLAG_SYSEX_STATUS_IN_PAYLOAD: u16 = 0x0001;
+
 fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
     let ppq = match smf.header.timing {
         Timing::Metrical(metrical) => metrical.as_int(),
@@ -71,13 +73,32 @@ fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
         return Err(Error::DataOverflow("too many tracks"));
     }
 
+    let sysex_present = smf.tracks.iter().any(|track| {
+        track.iter().any(|event| {
+            matches!(
+                &event.kind,
+                TrackEventKind::SysEx(_) | TrackEventKind::Escape(_)
+            )
+        })
+    });
+
     let mut out = Vec::new();
-    write_header(&mut out, ppq as u16, smf.tracks.len() as u16);
+    let flags = if sysex_present {
+        FLAG_SYSEX_STATUS_IN_PAYLOAD
+    } else {
+        0
+    };
+    write_header(&mut out, ppq as u16, smf.tracks.len() as u16, flags);
 
     for track in smf.tracks.iter() {
         let mut track_buf = Vec::new();
         for event in track {
-            encode_event(event.delta.as_int() as u64, &event.kind, &mut track_buf)?;
+            encode_event(
+                event.delta.as_int() as u64,
+                &event.kind,
+                &mut track_buf,
+                sysex_present,
+            )?;
         }
         if track_buf.len() > u32::MAX as usize {
             return Err(Error::DataOverflow("track chunk too large"));
@@ -112,7 +133,7 @@ fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
     }
 
     let track_count = u16::from_le_bytes([tsq_data[10], tsq_data[11]]);
-    let _flags = u16::from_le_bytes([tsq_data[12], tsq_data[13]]);
+    let flags = u16::from_le_bytes([tsq_data[12], tsq_data[13]]);
 
     let timing =
         u15::try_from(ppq).ok_or(Error::Unsupported("PPQ exceeds SMF metrical timing range"))?;
@@ -139,7 +160,7 @@ fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
         cursor = &cursor[len..];
 
         if id == b"TRK " {
-            let events = parse_track(chunk_data)?;
+            let events = parse_track(chunk_data, flags & FLAG_SYSEX_STATUS_IN_PAYLOAD != 0)?;
             tracks.push(events);
         }
     }
@@ -154,7 +175,10 @@ fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
     })
 }
 
-fn parse_track<'a>(mut data: &'a [u8]) -> Result<Vec<TrackEvent<'a>>, Error> {
+fn parse_track<'a>(
+    mut data: &'a [u8],
+    sysex_with_status: bool,
+) -> Result<Vec<TrackEvent<'a>>, Error> {
     let mut events = Vec::new();
     while !data.is_empty() {
         let header = read_u8(&mut data)?;
@@ -174,7 +198,7 @@ fn parse_track<'a>(mut data: &'a [u8]) -> Result<Vec<TrackEvent<'a>>, Error> {
         let event_kind = match kind {
             0x01 => parse_midi_event(&mut data)?,
             0x02 => parse_meta_event(&mut data)?,
-            0x03 => parse_sysex_event(&mut data)?,
+            0x03 => parse_sysex_event(&mut data, sysex_with_status)?,
             0x7E => return Err(Error::Unsupported("custom events are not supported")),
             _ => return Err(Error::Unsupported("unknown musical event type")),
         };
@@ -224,7 +248,8 @@ fn parse_midi_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
             let data2 = read_u8(data)?;
             MidiMessage::Controller {
                 controller: u7::try_from(data1).ok_or(Error::Invalid("controller out of range"))?,
-                value: u7::try_from(data2).ok_or(Error::Invalid("controller value out of range"))?,
+                value: u7::try_from(data2)
+                    .ok_or(Error::Invalid("controller value out of range"))?,
             }
         }
         0xC => {
@@ -236,8 +261,7 @@ fn parse_midi_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
         0xD => {
             let vel = read_u8(data)?;
             MidiMessage::ChannelAftertouch {
-                vel: u7::try_from(vel)
-                    .ok_or(Error::Invalid("aftertouch velocity out of range"))?,
+                vel: u7::try_from(vel).ok_or(Error::Invalid("aftertouch velocity out of range"))?,
             }
         }
         0xE => {
@@ -267,12 +291,26 @@ fn parse_meta_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
     Ok(TrackEventKind::Meta(meta))
 }
 
-fn parse_sysex_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error> {
+fn parse_sysex_event<'a>(
+    data: &mut &'a [u8],
+    has_status: bool,
+) -> Result<TrackEventKind<'a>, Error> {
     let len = read_vlq(data)?;
     let len_usize =
         usize::try_from(len).map_err(|_| Error::DataOverflow("sysex payload too large"))?;
     let payload = take_slice(data, len_usize)?;
-    Ok(TrackEventKind::SysEx(payload))
+    if has_status {
+        let (status, body) = payload
+            .split_first()
+            .ok_or(Error::Invalid("sysex payload missing status byte"))?;
+        match status {
+            0xF0 => Ok(TrackEventKind::SysEx(body)),
+            0xF7 => Ok(TrackEventKind::Escape(body)),
+            _ => Err(Error::Invalid("invalid sysex status byte")),
+        }
+    } else {
+        Ok(TrackEventKind::SysEx(payload))
+    }
 }
 
 fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Error> {
@@ -399,17 +437,22 @@ fn read_vlq<'a>(data: &mut &'a [u8]) -> Result<u64, Error> {
     Ok(value)
 }
 
-fn write_header(out: &mut Vec<u8>, ppq: u16, track_count: u16) {
+fn write_header(out: &mut Vec<u8>, ppq: u16, track_count: u16, flags: u16) {
     out.extend_from_slice(b"TSQ1");
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&ppq.to_le_bytes());
     out.push(0); // AbsUnit = microseconds
     out.push(0); // Reserved
     out.extend_from_slice(&track_count.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // Flags
+    out.extend_from_slice(&flags.to_le_bytes());
 }
 
-fn encode_event(delta: u64, kind: &TrackEventKind<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+fn encode_event(
+    delta: u64,
+    kind: &TrackEventKind<'_>,
+    out: &mut Vec<u8>,
+    sysex_with_status: bool,
+) -> Result<(), Error> {
     const DOMAIN_MUSICAL: u8 = 0;
 
     match kind {
@@ -424,10 +467,24 @@ fn encode_event(delta: u64, kind: &TrackEventKind<'_>, out: &mut Vec<u8>) -> Res
                 out.push(d2);
             }
         }
-        TrackEventKind::SysEx(data) | TrackEventKind::Escape(data) => {
+        TrackEventKind::SysEx(data) => {
             out.push(DOMAIN_MUSICAL | 0x03);
             write_vlq(delta, out);
-            write_vlq(data.len() as u64, out);
+            let len = data.len() + usize::from(sysex_with_status);
+            write_vlq(len as u64, out);
+            if sysex_with_status {
+                out.push(0xF0);
+            }
+            out.extend_from_slice(data);
+        }
+        TrackEventKind::Escape(data) => {
+            out.push(DOMAIN_MUSICAL | 0x03);
+            write_vlq(delta, out);
+            let len = data.len() + usize::from(sysex_with_status);
+            write_vlq(len as u64, out);
+            if sysex_with_status {
+                out.push(0xF7);
+            }
             out.extend_from_slice(data);
         }
         TrackEventKind::Meta(meta) => {
@@ -615,18 +672,23 @@ mod tests {
         assert_eq!(data, vec![0x81, 0x00]);
     }
 
-    fn build_tsq_track(events: &[TrackEventKind<'_>], deltas: &[u64]) -> Vec<u8> {
+    fn build_tsq_track(
+        events: &[TrackEventKind<'_>],
+        deltas: &[u64],
+        sysex_with_status: bool,
+    ) -> Vec<u8> {
         assert_eq!(events.len(), deltas.len());
         let mut track = Vec::new();
         for (event, delta) in events.iter().zip(deltas.iter()) {
-            encode_event(*delta, event, &mut track).expect("encode_event should succeed");
+            encode_event(*delta, event, &mut track, sysex_with_status)
+                .expect("encode_event should succeed");
         }
         track
     }
 
-    fn tsq_with_single_track(track_data: &[u8], ppq: u16) -> Vec<u8> {
+    fn tsq_with_single_track(track_data: &[u8], ppq: u16, flags: u16) -> Vec<u8> {
         let mut tsq = Vec::new();
-        write_header(&mut tsq, ppq, 1);
+        write_header(&mut tsq, ppq, 1, flags);
         tsq.extend_from_slice(b"TRK ");
         tsq.extend_from_slice(&(track_data.len() as u32).to_le_bytes());
         tsq.extend_from_slice(track_data);
@@ -642,23 +704,17 @@ mod tests {
         let events = [
             TrackEventKind::Midi {
                 channel,
-                message: MidiMessage::NoteOn {
-                    key,
-                    vel: velocity,
-                },
+                message: MidiMessage::NoteOn { key, vel: velocity },
             },
             TrackEventKind::Midi {
                 channel,
-                message: MidiMessage::NoteOff {
-                    key,
-                    vel: velocity,
-                },
+                message: MidiMessage::NoteOff { key, vel: velocity },
             },
             TrackEventKind::Meta(MetaMessage::EndOfTrack),
         ];
         let deltas = [0, 480, 0];
-        let track = build_tsq_track(&events, &deltas);
-        let tsq = tsq_with_single_track(&track, 480);
+        let track = build_tsq_track(&events, &deltas, false);
+        let tsq = tsq_with_single_track(&track, 480, 0);
 
         let midi = convert_tsq_to_midi_vec(&tsq).expect("conversion succeeds");
         let smf = Smf::parse(&midi).expect("generated MIDI parses");
@@ -677,7 +733,10 @@ mod tests {
         assert_eq!(track[2].delta.as_int(), 0);
 
         match &track[0].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 0);
                 match message {
                     MidiMessage::NoteOn { key: k, vel: v } => {
@@ -691,7 +750,10 @@ mod tests {
         }
 
         match &track[1].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 0);
                 match message {
                     MidiMessage::NoteOff { key: k, vel: v } => {
@@ -728,8 +790,8 @@ mod tests {
             TrackEventKind::Meta(MetaMessage::EndOfTrack),
         ];
         let deltas = [0, 12, 0];
-        let track = build_tsq_track(&events, &deltas);
-        let tsq = tsq_with_single_track(&track, 960);
+        let track = build_tsq_track(&events, &deltas, false);
+        let tsq = tsq_with_single_track(&track, 960, 0);
 
         let smf = super::convert_tsq_to_smf(&tsq).expect("conversion succeeds");
         assert_eq!(smf.tracks.len(), 1);
@@ -737,7 +799,10 @@ mod tests {
         assert_eq!(track.len(), 3);
 
         match &track[0].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 2);
                 match message {
                     MidiMessage::ProgramChange { program: p } => {
@@ -751,7 +816,10 @@ mod tests {
 
         assert_eq!(track[1].delta.as_int(), 12);
         match &track[1].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 2);
                 match message {
                     MidiMessage::ChannelAftertouch { vel } => {
@@ -761,6 +829,96 @@ mod tests {
                 }
             }
             _ => panic!("expected MIDI event"),
+        }
+
+        match &track[2].kind {
+            TrackEventKind::Meta(MetaMessage::EndOfTrack) => {}
+            _ => panic!("expected end of track"),
+        }
+    }
+
+    #[test]
+    fn parses_sysex_and_escape_events() {
+        let sysex_body: &[u8] = &[0x01, 0x02, 0x03];
+        let escape_body: &[u8] = &[0x7D, 0x7E];
+
+        let events = [
+            TrackEventKind::SysEx(sysex_body),
+            TrackEventKind::Escape(escape_body),
+            TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        ];
+        let deltas = [0, 90, 0];
+        let track = build_tsq_track(&events, &deltas, true);
+        let tsq = tsq_with_single_track(&track, 960, super::FLAG_SYSEX_STATUS_IN_PAYLOAD);
+
+        let smf = super::convert_tsq_to_smf(&tsq).expect("conversion succeeds");
+        assert_eq!(smf.tracks.len(), 1);
+        let track = &smf.tracks[0];
+        assert_eq!(track.len(), 3);
+
+        match &track[0].kind {
+            TrackEventKind::SysEx(data) => assert_eq!(*data, sysex_body),
+            _ => panic!("expected sysex event"),
+        }
+
+        assert_eq!(track[1].delta.as_int(), 90);
+        match &track[1].kind {
+            TrackEventKind::Escape(data) => assert_eq!(*data, escape_body),
+            _ => panic!("expected escape event"),
+        }
+
+        match &track[2].kind {
+            TrackEventKind::Meta(MetaMessage::EndOfTrack) => {}
+            _ => panic!("expected end of track"),
+        }
+    }
+
+    #[test]
+    fn midi_roundtrip_preserves_sysex_escape() {
+        let track = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::SysEx(&[0x10, 0x20]),
+            },
+            TrackEvent {
+                delta: u28::from(24u32),
+                kind: TrackEventKind::Escape(&[0x30, 0x40, 0x41]),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let smf = Smf {
+            header: Header::new(Format::SingleTrack, Timing::Metrical(u15::from(480u16))),
+            tracks: vec![track],
+        };
+
+        let mut midi_bytes = Vec::new();
+        smf.write(&mut midi_bytes).expect("writing SMF succeeds");
+
+        let tsq = super::convert_midi_to_tsq_vec(&midi_bytes).expect("TSQ conversion succeeds");
+        let flags = u16::from_le_bytes([tsq[12], tsq[13]]);
+        assert_eq!(
+            flags & super::FLAG_SYSEX_STATUS_IN_PAYLOAD,
+            super::FLAG_SYSEX_STATUS_IN_PAYLOAD
+        );
+
+        let midi_roundtrip = super::convert_tsq_to_midi_vec(&tsq).expect("roundtrip succeeds");
+        let smf_roundtrip = Smf::parse(&midi_roundtrip).expect("parsed MIDI");
+        assert_eq!(smf_roundtrip.tracks.len(), 1);
+        let track = &smf_roundtrip.tracks[0];
+        assert_eq!(track.len(), 3);
+
+        match &track[0].kind {
+            TrackEventKind::SysEx(data) => assert_eq!(*data, &[0x10, 0x20][..]),
+            _ => panic!("expected sysex start"),
+        }
+
+        assert_eq!(track[1].delta.as_int(), 24);
+        match &track[1].kind {
+            TrackEventKind::Escape(data) => assert_eq!(*data, &[0x30, 0x40, 0x41][..]),
+            _ => panic!("expected escape continuation"),
         }
 
         match &track[2].kind {
