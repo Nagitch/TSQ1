@@ -4,10 +4,14 @@ extern crate alloc;
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 use core::fmt;
 
-use midly::num::u4;
-use midly::{Fps, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
+use midly::num::{u14, u15, u24, u28, u4, u7};
+use midly::{
+    Format, Fps, Header, MetaMessage, MidiMessage, PitchBend, Smf, SmpteTime, Timing, TrackEvent,
+    TrackEventKind,
+};
 
 /// Error type for TSQ1 conversions.
 #[derive(Debug)]
@@ -18,6 +22,8 @@ pub enum Error {
     Unsupported(&'static str),
     /// The resulting data exceeded format limits.
     DataOverflow(&'static str),
+    /// Invalid or malformed TSQ input data.
+    Invalid(&'static str),
 }
 
 impl From<midly::Error> for Error {
@@ -32,6 +38,7 @@ impl fmt::Display for Error {
             Error::Midi(e) => write!(f, "MIDI parse error: {e}"),
             Error::Unsupported(msg) => write!(f, "unsupported input: {msg}"),
             Error::DataOverflow(msg) => write!(f, "data overflow: {msg}"),
+            Error::Invalid(msg) => write!(f, "invalid input: {msg}"),
         }
     }
 }
@@ -43,6 +50,15 @@ impl std::error::Error for Error {}
 pub fn convert_midi_to_tsq_vec(midi_data: &[u8]) -> Result<Vec<u8>, Error> {
     let smf = Smf::parse(midi_data)?;
     convert_smf_to_tsq(&smf)
+}
+
+/// Convert TSQ1 bytes into a Standard MIDI File binary buffer.
+pub fn convert_tsq_to_midi_vec(tsq_data: &[u8]) -> Result<Vec<u8>, Error> {
+    let smf = convert_tsq_to_smf(tsq_data)?;
+    let mut out = Vec::new();
+    smf.write(&mut out)
+        .map_err(|_| Error::Invalid("failed to encode SMF"))?;
+    Ok(out)
 }
 
 fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
@@ -72,6 +88,292 @@ fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
     }
 
     Ok(out)
+}
+
+fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
+    const HEADER_SIZE: usize = 14;
+    if tsq_data.len() < HEADER_SIZE {
+        return Err(Error::Invalid("TSQ header truncated"));
+    }
+
+    if &tsq_data[..4] != b"TSQ1" {
+        return Err(Error::Invalid("TSQ magic missing"));
+    }
+
+    let version = u16::from_le_bytes([tsq_data[4], tsq_data[5]]);
+    if version != 1 {
+        return Err(Error::Unsupported("unsupported TSQ version"));
+    }
+
+    let ppq = u16::from_le_bytes([tsq_data[6], tsq_data[7]]);
+    let abs_unit = tsq_data[8];
+    if abs_unit != 0 {
+        return Err(Error::Unsupported("absolute timing domain not supported"));
+    }
+
+    let track_count = u16::from_le_bytes([tsq_data[10], tsq_data[11]]);
+    let _flags = u16::from_le_bytes([tsq_data[12], tsq_data[13]]);
+
+    let timing =
+        u15::try_from(ppq).ok_or(Error::Unsupported("PPQ exceeds SMF metrical timing range"))?;
+    let format = if track_count <= 1 {
+        Format::SingleTrack
+    } else {
+        Format::Parallel
+    };
+
+    let mut cursor = &tsq_data[HEADER_SIZE..];
+    let mut tracks: Vec<Vec<TrackEvent<'a>>> = Vec::new();
+
+    while !cursor.is_empty() {
+        if cursor.len() < 8 {
+            return Err(Error::Invalid("TSQ chunk header truncated"));
+        }
+        let id = &cursor[..4];
+        let len = u32::from_le_bytes([cursor[4], cursor[5], cursor[6], cursor[7]]) as usize;
+        cursor = &cursor[8..];
+        if cursor.len() < len {
+            return Err(Error::Invalid("TSQ chunk length exceeds remaining data"));
+        }
+        let chunk_data = &cursor[..len];
+        cursor = &cursor[len..];
+
+        if id == b"TRK " {
+            let events = parse_track(chunk_data)?;
+            tracks.push(events);
+        }
+    }
+
+    if tracks.len() != track_count as usize {
+        return Err(Error::Invalid("track count mismatch"));
+    }
+
+    Ok(Smf {
+        header: Header::new(format, Timing::Metrical(timing)),
+        tracks,
+    })
+}
+
+fn parse_track<'a>(mut data: &'a [u8]) -> Result<Vec<TrackEvent<'a>>, Error> {
+    let mut events = Vec::new();
+    while !data.is_empty() {
+        let header = read_u8(&mut data)?;
+        let domain = header >> 7;
+        if domain != 0 {
+            return Err(Error::Unsupported(
+                "absolute domain events are not supported",
+            ));
+        }
+        let kind = header & 0x7F;
+        let delta = read_vlq(&mut data)?;
+        let delta_u32 =
+            u32::try_from(delta).map_err(|_| Error::DataOverflow("delta exceeds u32"))?;
+        let delta =
+            u28::try_from(delta_u32).ok_or(Error::DataOverflow("delta exceeds MIDI limits"))?;
+
+        let event_kind = match kind {
+            0x01 => parse_midi_event(&mut data)?,
+            0x02 => parse_meta_event(&mut data)?,
+            0x03 => parse_sysex_event(&mut data)?,
+            0x7E => return Err(Error::Unsupported("custom events are not supported")),
+            _ => return Err(Error::Unsupported("unknown musical event type")),
+        };
+
+        events.push(TrackEvent {
+            delta,
+            kind: event_kind,
+        });
+    }
+    Ok(events)
+}
+
+fn parse_midi_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error> {
+    let status = read_u8(data)?;
+    if !(0x80..=0xEF).contains(&status) {
+        return Err(Error::Invalid("invalid MIDI status byte"));
+    }
+    let data1 = read_u8(data)?;
+    let data2 = read_u8(data)?;
+
+    let channel = u4::try_from(status & 0x0F).ok_or(Error::Invalid("invalid MIDI channel"))?;
+    let message = match status >> 4 {
+        0x8 => MidiMessage::NoteOff {
+            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+        },
+        0x9 => MidiMessage::NoteOn {
+            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+        },
+        0xA => MidiMessage::Aftertouch {
+            key: u7::try_from(data1).ok_or(Error::Invalid("note key out of range"))?,
+            vel: u7::try_from(data2).ok_or(Error::Invalid("velocity out of range"))?,
+        },
+        0xB => MidiMessage::Controller {
+            controller: u7::try_from(data1).ok_or(Error::Invalid("controller out of range"))?,
+            value: u7::try_from(data2).ok_or(Error::Invalid("controller value out of range"))?,
+        },
+        0xC => MidiMessage::ProgramChange {
+            program: u7::try_from(data1).ok_or(Error::Invalid("program out of range"))?,
+        },
+        0xD => MidiMessage::ChannelAftertouch {
+            vel: u7::try_from(data1).ok_or(Error::Invalid("aftertouch velocity out of range"))?,
+        },
+        0xE => {
+            let lsb = u7::try_from(data1).ok_or(Error::Invalid("pitch bend LSB out of range"))?;
+            let msb = u7::try_from(data2).ok_or(Error::Invalid("pitch bend MSB out of range"))?;
+            let raw = ((msb.as_int() as u16) << 7) | lsb.as_int() as u16;
+            let bend = u14::try_from(raw).ok_or(Error::Invalid("pitch bend value out of range"))?;
+            MidiMessage::PitchBend {
+                bend: PitchBend(bend),
+            }
+        }
+        _ => return Err(Error::Invalid("unsupported MIDI status")),
+    };
+
+    Ok(TrackEventKind::Midi { channel, message })
+}
+
+fn parse_meta_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error> {
+    let ty = read_u8(data)?;
+    let len = read_vlq(data)?;
+    let len_usize =
+        usize::try_from(len).map_err(|_| Error::DataOverflow("meta payload too large"))?;
+    let payload = take_slice(data, len_usize)?;
+    let meta = meta_from_payload(ty, payload)?;
+    Ok(TrackEventKind::Meta(meta))
+}
+
+fn parse_sysex_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error> {
+    let len = read_vlq(data)?;
+    let len_usize =
+        usize::try_from(len).map_err(|_| Error::DataOverflow("sysex payload too large"))?;
+    let payload = take_slice(data, len_usize)?;
+    Ok(TrackEventKind::SysEx(payload))
+}
+
+fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Error> {
+    use MetaMessage::*;
+    Ok(match ty {
+        0x00 => match data.len() {
+            0 => TrackNumber(None),
+            2 => {
+                let number = u16::from_be_bytes([data[0], data[1]]);
+                TrackNumber(Some(number))
+            }
+            _ => return Err(Error::Invalid("invalid track number payload")),
+        },
+        0x01 => Text(data),
+        0x02 => Copyright(data),
+        0x03 => TrackName(data),
+        0x04 => InstrumentName(data),
+        0x05 => Lyric(data),
+        0x06 => Marker(data),
+        0x07 => CuePoint(data),
+        0x08 => ProgramName(data),
+        0x09 => DeviceName(data),
+        0x20 => {
+            let channel = *data
+                .get(0)
+                .ok_or(Error::Invalid("missing MIDI channel value"))?;
+            let channel =
+                u4::try_from(channel).ok_or(Error::Invalid("MIDI channel out of range"))?;
+            MidiChannel(channel)
+        }
+        0x21 => {
+            let port = *data
+                .get(0)
+                .ok_or(Error::Invalid("missing MIDI port value"))?;
+            let port = u7::try_from(port).ok_or(Error::Invalid("MIDI port out of range"))?;
+            MidiPort(port)
+        }
+        0x2F => {
+            if !data.is_empty() {
+                return Err(Error::Invalid("end of track meta should be empty"));
+            }
+            EndOfTrack
+        }
+        0x51 => {
+            if data.len() != 3 {
+                return Err(Error::Invalid("tempo meta must be 3 bytes"));
+            }
+            let value = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32;
+            let tempo = u24::try_from(value).ok_or(Error::Invalid("tempo out of range"))?;
+            Tempo(tempo)
+        }
+        0x54 => {
+            if data.len() != 5 {
+                return Err(Error::Invalid("smpte offset meta must be 5 bytes"));
+            }
+            let fps_code = data[0] >> 5;
+            let fps = match fps_code {
+                0 => Fps::Fps24,
+                1 => Fps::Fps25,
+                2 => Fps::Fps29,
+                3 => Fps::Fps30,
+                _ => return Err(Error::Invalid("invalid SMPTE FPS code")),
+            };
+            let hour = data[0] & 0x1F;
+            let minute = data[1];
+            let second = data[2];
+            let frame = data[3];
+            let subframe = data[4];
+            let smpte = SmpteTime::new(hour, minute, second, frame, subframe, fps)
+                .ok_or(Error::Invalid("invalid SMPTE offset values"))?;
+            SmpteOffset(smpte)
+        }
+        0x58 => {
+            if data.len() != 4 {
+                return Err(Error::Invalid("time signature meta must be 4 bytes"));
+            }
+            TimeSignature(data[0], data[1], data[2], data[3])
+        }
+        0x59 => {
+            if data.len() != 2 {
+                return Err(Error::Invalid("key signature meta must be 2 bytes"));
+            }
+            let sharps = data[0] as i8;
+            let is_minor = data[1] != 0;
+            KeySignature(sharps, is_minor)
+        }
+        0x7F => SequencerSpecific(data),
+        _ => Unknown(ty, data),
+    })
+}
+
+fn read_u8<'a>(data: &mut &'a [u8]) -> Result<u8, Error> {
+    if data.is_empty() {
+        return Err(Error::Invalid("unexpected end of track data"));
+    }
+    let byte = data[0];
+    *data = &data[1..];
+    Ok(byte)
+}
+
+fn take_slice<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
+    if data.len() < len {
+        return Err(Error::Invalid("payload exceeds remaining track data"));
+    }
+    let (prefix, rest) = data.split_at(len);
+    *data = rest;
+    Ok(prefix)
+}
+
+fn read_vlq<'a>(data: &mut &'a [u8]) -> Result<u64, Error> {
+    let mut value = 0u64;
+    let mut read = 0usize;
+    loop {
+        let byte = read_u8(data)?;
+        value = (value << 7) | (byte & 0x7F) as u64;
+        read += 1;
+        if read > 10 {
+            return Err(Error::Invalid("VLQ exceeds maximum length"));
+        }
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    Ok(value)
 }
 
 fn write_header(out: &mut Vec<u8>, ppq: u16, track_count: u16) {
