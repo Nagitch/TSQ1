@@ -926,4 +926,51 @@ mod tests {
             _ => panic!("expected end of track"),
         }
     }
+
+    #[test]
+    fn midi_without_sysex_does_not_set_status_flag() {
+        let channel = u4::try_from(0).unwrap();
+        let key = u7::try_from(64).unwrap();
+        let velocity = u7::try_from(90).unwrap();
+        let duration = u28::from(120u32);
+
+        let track = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Midi {
+                    channel,
+                    message: MidiMessage::NoteOn {
+                        key,
+                        vel: velocity,
+                    },
+                },
+            },
+            TrackEvent {
+                delta: duration,
+                kind: TrackEventKind::Midi {
+                    channel,
+                    message: MidiMessage::NoteOff {
+                        key,
+                        vel: velocity,
+                    },
+                },
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+
+        let smf = Smf {
+            header: Header::new(Format::SingleTrack, Timing::Metrical(u15::from(960u16))),
+            tracks: vec![track],
+        };
+
+        let mut midi_bytes = Vec::new();
+        smf.write(&mut midi_bytes).expect("writing SMF succeeds");
+
+        let tsq = super::convert_midi_to_tsq_vec(&midi_bytes).expect("conversion succeeds");
+        let flags = u16::from_le_bytes([tsq[12], tsq[13]]);
+        assert_eq!(flags & super::FLAG_SYSEX_STATUS_IN_PAYLOAD, 0);
+    }
 }
