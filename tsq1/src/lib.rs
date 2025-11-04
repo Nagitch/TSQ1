@@ -973,4 +973,143 @@ mod tests {
         let flags = u16::from_le_bytes([tsq[12], tsq[13]]);
         assert_eq!(flags & super::FLAG_SYSEX_STATUS_IN_PAYLOAD, 0);
     }
+
+    #[test]
+    fn midi_roundtrip_matches_original_content() {
+        let conductor_name: &[u8] = b"Conductor";
+        let lead_name: &[u8] = b"Lead";
+        let tempo = u24::from(500_000u32);
+
+        let mut track0 = Vec::new();
+        track0.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::TrackName(conductor_name)),
+        });
+        track0.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
+        });
+        track0.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::Tempo(tempo)),
+        });
+        track0.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+
+        let channel = u4::try_from(1).unwrap();
+        let key = u7::try_from(67).unwrap();
+        let velocity = u7::try_from(110).unwrap();
+
+        let mut track1 = Vec::new();
+        track1.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::TrackName(lead_name)),
+        });
+        track1.push(TrackEvent {
+            delta: u28::from(120u32),
+            kind: TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::NoteOn { key, vel: velocity },
+            },
+        });
+        track1.push(TrackEvent {
+            delta: u28::from(480u32),
+            kind: TrackEventKind::Midi {
+                channel,
+                message: MidiMessage::NoteOff { key, vel: velocity },
+            },
+        });
+        track1.push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+
+        let smf = Smf {
+            header: Header::new(Format::Parallel, Timing::Metrical(u15::from(960u16))),
+            tracks: vec![track0, track1],
+        };
+
+        let mut midi_bytes = Vec::new();
+        smf.write(&mut midi_bytes).expect("writing SMF succeeds");
+
+        let tsq = super::convert_midi_to_tsq_vec(&midi_bytes).expect("TSQ conversion succeeds");
+        let midi_roundtrip = super::convert_tsq_to_midi_vec(&tsq).expect("roundtrip conversion succeeds");
+
+        let smf_roundtrip = Smf::parse(&midi_roundtrip).expect("roundtrip MIDI parses");
+        assert_eq!(smf_roundtrip.header.format, Format::Parallel);
+        match smf_roundtrip.header.timing {
+            Timing::Metrical(ppq) => assert_eq!(ppq.as_int(), 960),
+            _ => panic!("expected metrical timing"),
+        }
+
+        assert_eq!(smf_roundtrip.tracks.len(), 2);
+
+        let roundtrip_track0 = &smf_roundtrip.tracks[0];
+        assert_eq!(roundtrip_track0.len(), 4);
+        match &roundtrip_track0[0].kind {
+            TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
+                assert_eq!(name.as_ref(), b"Conductor")
+            }
+            other => panic!("unexpected first meta event: {other:?}"),
+        }
+        match &roundtrip_track0[1].kind {
+            TrackEventKind::Meta(MetaMessage::TimeSignature(num, denom, clocks, notes)) => {
+                assert_eq!((*num, *denom, *clocks, *notes), (4, 2, 24, 8));
+            }
+            other => panic!("unexpected time signature event: {other:?}"),
+        }
+        match &roundtrip_track0[2].kind {
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) => {
+                assert_eq!(value.as_int(), 500_000);
+            }
+            other => panic!("unexpected tempo event: {other:?}"),
+        }
+        assert!(matches!(
+            &roundtrip_track0[3].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+
+        let roundtrip_track1 = &smf_roundtrip.tracks[1];
+        assert_eq!(roundtrip_track1.len(), 4);
+        match &roundtrip_track1[0].kind {
+            TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
+                assert_eq!(name.as_ref(), b"Lead")
+            }
+            other => panic!("unexpected track name event: {other:?}"),
+        }
+        assert_eq!(roundtrip_track1[1].delta.as_int(), 120);
+        match &roundtrip_track1[1].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 1);
+                match message {
+                    MidiMessage::NoteOn { key: note, vel } => {
+                        assert_eq!(note.as_int(), 67);
+                        assert_eq!(vel.as_int(), 110);
+                    }
+                    other => panic!("unexpected message for note on: {other:?}"),
+                }
+            }
+            other => panic!("unexpected second track event: {other:?}"),
+        }
+        assert_eq!(roundtrip_track1[2].delta.as_int(), 480);
+        match &roundtrip_track1[2].kind {
+            TrackEventKind::Midi { channel: ch, message } => {
+                assert_eq!(ch.as_int(), 1);
+                match message {
+                    MidiMessage::NoteOff { key: note, vel } => {
+                        assert_eq!(note.as_int(), 67);
+                        assert_eq!(vel.as_int(), 110);
+                    }
+                    other => panic!("unexpected message for note off: {other:?}"),
+                }
+            }
+            other => panic!("unexpected third track event: {other:?}"),
+        }
+        assert!(matches!(
+            &roundtrip_track1[3].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+    }
 }
