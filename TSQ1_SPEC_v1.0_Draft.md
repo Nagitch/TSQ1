@@ -12,6 +12,7 @@ v1.0 draft without historical notes so that implementers can focus on the latest
 - Variable-length quantity (VLQ) encoding for delta times (compatible with SMF)
 - Chunk-based container with dedicated chunk identifiers (`"TRK "`, `"TMAP"`, `"SYNC"`, ...)
 - Synchronisation through tempo maps and absolute anchors
+ - Optional locator metadata via `"MARK"` chunk (sections, drops, etc.)
 
 ---
 
@@ -35,6 +36,7 @@ v1.0 draft without historical notes so that implementers can focus on the latest
 - `"TRK "`: Event stream chunk (musical and absolute events)
 - `"TMAP"`: Tempo map entries `(tick:u64, us_per_qn:u32)*`
 - `"SYNC"`: Absolute anchors `(tick:u64, time_abs:u64)*` where `time_abs` uses `AbsUnit`
+ - `"MARK"`: Locators/markers for arrangement sections and cues
 
 Implementations may introduce additional chunks; unknown chunk IDs must be skipped by
 using the declared length.
@@ -111,15 +113,59 @@ using the declared length.
 
 ---
 
+## 6. MARK Chunk (Locators)
+```
+"MARK"[len:u32] { [pos_kind:u8][pos:u64][name_len:VLQ][name:N][class:u8][color_rgba:u32]? }*
+```
+- Purpose: store non-audio, non-control metadata for arrangement navigation such as Ableton Live-style locators (Intro, Breakdown, Drop, etc.).
+- Positioning:
+  - `pos_kind`: `0 = Musical(tick)`, `1 = Absolute(time_abs in AbsUnit)`
+  - `pos`: when `pos_kind=0`, PPQ ticks from start; when `1`, absolute time from start in `AbsUnit`.
+- Label:
+  - `name_len`: VLQ length of UTF-8 `name`
+  - `name`: UTF-8 string; implementers should preserve casing and emoji if present
+- Classification:
+  - `class` (u8) focuses on SMF-compatible semantics to support non-musical timelines as well:
+    - `0x00 = Generic`
+    - `0x20 = Cue`
+    - `0x7F = Custom`
+- Color (optional):
+  - `color_rgba` MAY be present; it is optional and independent of `class`.
+  - Encoded as little-endian `u32` RGBA (`0xAARRGGBB`). Consumers SHOULD ignore if unsupported.
+- Ordering: entries must be sorted by `pos` within each `pos_kind`.
+- Uniqueness: multiple locators may share the same position; consumers should handle duplicates.
+- Extensibility: unknown `class` values must be accepted and treated as `Generic`.
+
+### 6.1 Rationale
+Locators are intentionally separated from the `TRK` event stream to avoid timing and playback side effects. They provide human-readable navigation and interoperability for general time-series sequences (not limited to music) without constraining controller/event semantics.
+
+### 6.2 Examples
+```
+// Musical locator labeled "Generic"
+pos_kind = 0  // Musical
+pos      = 1024  // ticks from start
+name_len = VLQ(len("Generic Marker"))
+name     = "Generic Marker"
+class    = 0x00  // Generic
+
+// Absolute locator at 90s, labeled "Cue", with optional color
+pos_kind   = 1  // Absolute
+pos        = 90_000_000  // assuming AbsUnit=μs
+name_len   = VLQ(len("Drop"))
+name       = "Cue"
+class      = 0x20  // Cue
+color_rgba = 0xFF00FF00  // optional opaque green
+```
+
 ## 6. Implementation Notes
 - Use little endian encoding consistently
-- VLQ supports up to 10 bytes (u64 range)
+## 7. Implementation Notes
 - Practical PPQ values: 480 or 960; absolute μs is common, ns is optional for high precision
 - Maintaining per-bar or per-second indexes improves seek performance
 
 ---
 
-## 7. Examples
+## 8. Examples
 ### 7.1 Musical event after 240 ticks (OSC RAW)
 ```
 Header = 0b0_0000000 (Domain = Musical, Kind = OSC)
