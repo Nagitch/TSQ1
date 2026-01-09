@@ -12,4 +12,4 @@ std = []
 
 [dependencies]
 midly = { version = "0.5", default-features = false, features = ["alloc"] }
-osc-data-model = { git = "https://github.com/Nagitch/osc-data-model" }
+osc-ir = "0.1.0-alpha.1"
