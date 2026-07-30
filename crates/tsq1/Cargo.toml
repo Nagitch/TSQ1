@@ -1,0 +1,25 @@
+[package]
+name = "tsq1"
+description = "Convert Standard MIDI Files to and from the TSQ1 timeline format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+keywords = ["timeline", "midi", "sequencer", "binary-format"]
+categories = ["encoding", "multimedia::audio", "no-std"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+midly.workspace = true
+
+[lints]
+workspace = true

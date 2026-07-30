@@ -1,8 +1,15 @@
+//! TSQ1 conversion primitives.
+//!
+//! This crate converts Standard MIDI Files (SMF) to and from the TSQ1 binary
+//! timeline format. The default `std` feature also exposes standard error
+//! integration and a C-compatible allocation API.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
 use alloc::borrow::Cow;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::fmt;
@@ -88,7 +95,7 @@ fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
     } else {
         0
     };
-    write_header(&mut out, ppq as u16, smf.tracks.len() as u16, flags);
+    write_header(&mut out, ppq, smf.tracks.len() as u16, flags);
 
     for track in smf.tracks.iter() {
         let mut track_buf = Vec::new();
@@ -335,7 +342,7 @@ fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Erro
         0x09 => DeviceName(data),
         0x20 => {
             let channel = *data
-                .get(0)
+                .first()
                 .ok_or(Error::Invalid("missing MIDI channel value"))?;
             let channel =
                 u4::try_from(channel).ok_or(Error::Invalid("MIDI channel out of range"))?;
@@ -343,7 +350,7 @@ fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Erro
         }
         0x21 => {
             let port = *data
-                .get(0)
+                .first()
                 .ok_or(Error::Invalid("missing MIDI port value"))?;
             let port = u7::try_from(port).ok_or(Error::Invalid("MIDI port out of range"))?;
             MidiPort(port)
@@ -402,7 +409,7 @@ fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Erro
     })
 }
 
-fn read_u8<'a>(data: &mut &'a [u8]) -> Result<u8, Error> {
+fn read_u8(data: &mut &[u8]) -> Result<u8, Error> {
     if data.is_empty() {
         return Err(Error::Invalid("unexpected end of track data"));
     }
@@ -420,7 +427,7 @@ fn take_slice<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
     Ok(prefix)
 }
 
-fn read_vlq<'a>(data: &mut &'a [u8]) -> Result<u64, Error> {
+fn read_vlq(data: &mut &[u8]) -> Result<u64, Error> {
     let mut value = 0u64;
     let mut read = 0usize;
     loop {
@@ -587,6 +594,7 @@ fn write_vlq(mut value: u64, out: &mut Vec<u8>) {
 }
 
 /// FFI bindings for external consumers.
+#[cfg(feature = "std")]
 pub mod ffi {
     use super::*;
     use alloc::vec::Vec;
@@ -595,8 +603,11 @@ pub mod ffi {
     /// Buffer returned by the FFI conversion helpers.
     #[repr(C)]
     pub struct Tsq1Buffer {
+        /// Pointer to the allocated bytes.
         pub ptr: *mut u8,
+        /// Number of initialized bytes.
         pub len: usize,
+        /// Capacity of the allocation.
         pub capacity: usize,
     }
 
@@ -604,15 +615,23 @@ pub mod ffi {
     #[repr(C)]
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub enum Tsq1Status {
+        /// Conversion completed successfully.
         Ok = 0,
+        /// A required input or output pointer was null.
         NullPointer = 1,
+        /// The input could not be converted.
         ConversionError = 2,
     }
 
     /// Convert SMF bytes into TSQ1 format, allocating a new buffer for the result.
     ///
     /// The caller is responsible for freeing the resulting buffer with [`tsq1_buffer_free`].
-    #[no_mangle]
+    ///
+    /// # Safety
+    ///
+    /// `midi_ptr` must point to `midi_len` readable bytes, and `out` must point
+    /// to writable storage for one [`Tsq1Buffer`]. The returned allocation must
+    /// be released exactly once with [`tsq1_buffer_free`].
     pub unsafe extern "C" fn tsq1_mid_to_tsq(
         midi_ptr: *const u8,
         midi_len: usize,
@@ -621,15 +640,17 @@ pub mod ffi {
         if midi_ptr.is_null() || out.is_null() {
             return Tsq1Status::NullPointer;
         }
-        ptr::write(
-            out,
-            Tsq1Buffer {
-                ptr: ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            },
-        );
-        let midi = slice::from_raw_parts(midi_ptr, midi_len);
+        unsafe {
+            ptr::write(
+                out,
+                Tsq1Buffer {
+                    ptr: ptr::null_mut(),
+                    len: 0,
+                    capacity: 0,
+                },
+            );
+        }
+        let midi = unsafe { slice::from_raw_parts(midi_ptr, midi_len) };
         match super::convert_midi_to_tsq_vec(midi) {
             Ok(mut data) => {
                 let buffer = Tsq1Buffer {
@@ -638,7 +659,9 @@ pub mod ffi {
                     capacity: data.capacity(),
                 };
                 mem::forget(data);
-                ptr::write(out, buffer);
+                unsafe {
+                    ptr::write(out, buffer);
+                }
                 Tsq1Status::Ok
             }
             Err(_) => Tsq1Status::ConversionError,
@@ -646,12 +669,17 @@ pub mod ffi {
     }
 
     /// Release a buffer produced by [`tsq1_mid_to_tsq`].
-    #[no_mangle]
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be either the untouched value returned by
+    /// [`tsq1_mid_to_tsq`] or a buffer whose pointer is null. A non-null buffer
+    /// must be passed exactly once.
     pub unsafe extern "C" fn tsq1_buffer_free(buf: Tsq1Buffer) {
         if buf.ptr.is_null() {
             return;
         }
-        let _ = Vec::from_raw_parts(buf.ptr, buf.len, buf.capacity);
+        let _ = unsafe { Vec::from_raw_parts(buf.ptr, buf.len, buf.capacity) };
     }
 }
 
@@ -939,20 +967,14 @@ mod tests {
                 delta: 0.into(),
                 kind: TrackEventKind::Midi {
                     channel,
-                    message: MidiMessage::NoteOn {
-                        key,
-                        vel: velocity,
-                    },
+                    message: MidiMessage::NoteOn { key, vel: velocity },
                 },
             },
             TrackEvent {
                 delta: duration,
                 kind: TrackEventKind::Midi {
                     channel,
-                    message: MidiMessage::NoteOff {
-                        key,
-                        vel: velocity,
-                    },
+                    message: MidiMessage::NoteOff { key, vel: velocity },
                 },
             },
             TrackEvent {
@@ -980,51 +1002,53 @@ mod tests {
         let lead_name: &[u8] = b"Lead";
         let tempo = u24::from(500_000u32);
 
-        let mut track0 = Vec::new();
-        track0.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::TrackName(conductor_name)),
-        });
-        track0.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
-        });
-        track0.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::Tempo(tempo)),
-        });
-        track0.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-        });
+        let track0 = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TrackName(conductor_name)),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(tempo)),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
 
         let channel = u4::try_from(1).unwrap();
         let key = u7::try_from(67).unwrap();
         let velocity = u7::try_from(110).unwrap();
 
-        let mut track1 = Vec::new();
-        track1.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::TrackName(lead_name)),
-        });
-        track1.push(TrackEvent {
-            delta: u28::from(120u32),
-            kind: TrackEventKind::Midi {
-                channel,
-                message: MidiMessage::NoteOn { key, vel: velocity },
+        let track1 = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TrackName(lead_name)),
             },
-        });
-        track1.push(TrackEvent {
-            delta: u28::from(480u32),
-            kind: TrackEventKind::Midi {
-                channel,
-                message: MidiMessage::NoteOff { key, vel: velocity },
+            TrackEvent {
+                delta: u28::from(120u32),
+                kind: TrackEventKind::Midi {
+                    channel,
+                    message: MidiMessage::NoteOn { key, vel: velocity },
+                },
             },
-        });
-        track1.push(TrackEvent {
-            delta: 0.into(),
-            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-        });
+            TrackEvent {
+                delta: u28::from(480u32),
+                kind: TrackEventKind::Midi {
+                    channel,
+                    message: MidiMessage::NoteOff { key, vel: velocity },
+                },
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
 
         let smf = Smf {
             header: Header::new(Format::Parallel, Timing::Metrical(u15::from(960u16))),
@@ -1035,7 +1059,8 @@ mod tests {
         smf.write(&mut midi_bytes).expect("writing SMF succeeds");
 
         let tsq = super::convert_midi_to_tsq_vec(&midi_bytes).expect("TSQ conversion succeeds");
-        let midi_roundtrip = super::convert_tsq_to_midi_vec(&tsq).expect("roundtrip conversion succeeds");
+        let midi_roundtrip =
+            super::convert_tsq_to_midi_vec(&tsq).expect("roundtrip conversion succeeds");
 
         let smf_roundtrip = Smf::parse(&midi_roundtrip).expect("roundtrip MIDI parses");
         assert_eq!(smf_roundtrip.header.format, Format::Parallel);
@@ -1050,7 +1075,7 @@ mod tests {
         assert_eq!(roundtrip_track0.len(), 4);
         match &roundtrip_track0[0].kind {
             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
-                assert_eq!(name.as_ref(), b"Conductor")
+                assert_eq!(*name, b"Conductor")
             }
             other => panic!("unexpected first meta event: {other:?}"),
         }
@@ -1075,13 +1100,16 @@ mod tests {
         assert_eq!(roundtrip_track1.len(), 4);
         match &roundtrip_track1[0].kind {
             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
-                assert_eq!(name.as_ref(), b"Lead")
+                assert_eq!(*name, b"Lead")
             }
             other => panic!("unexpected track name event: {other:?}"),
         }
         assert_eq!(roundtrip_track1[1].delta.as_int(), 120);
         match &roundtrip_track1[1].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 1);
                 match message {
                     MidiMessage::NoteOn { key: note, vel } => {
@@ -1095,7 +1123,10 @@ mod tests {
         }
         assert_eq!(roundtrip_track1[2].delta.as_int(), 480);
         match &roundtrip_track1[2].kind {
-            TrackEventKind::Midi { channel: ch, message } => {
+            TrackEventKind::Midi {
+                channel: ch,
+                message,
+            } => {
                 assert_eq!(ch.as_int(), 1);
                 match message {
                     MidiMessage::NoteOff { key: note, vel } => {

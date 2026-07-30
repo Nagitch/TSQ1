@@ -1,0 +1,18 @@
+[package]
+name = "tsq1-cli"
+description = "Command-line converter for Standard MIDI Files and TSQ1 sequences"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tsq1 = { path = "../../crates/tsq1" }
+
+[lints]
+workspace = true

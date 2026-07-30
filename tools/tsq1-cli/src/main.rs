@@ -1,3 +1,5 @@
+//! Command-line conversion between Standard MIDI Files and TSQ1 sequences.
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
