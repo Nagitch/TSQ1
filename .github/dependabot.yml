@@ -26,3 +26,16 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: npm
+    directory: /editors/vscode-tsq1
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 10
+    groups:
+      vscode-extension-dependencies:
+        patterns:
+          - "*"

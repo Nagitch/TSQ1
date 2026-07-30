@@ -1,7 +1,8 @@
 # tsq1
 
-`tsq1` converts Standard MIDI File bytes to and from the musical-time subset
-of the TSQ1 binary timeline format.
+`tsq1` provides the complete owned TSQ1 v1 draft model, validation, canonical
+binary encoding, checked musical/absolute time mapping, and Standard MIDI File
+interoperability.
 
 ```rust
 let midi = std::fs::read("input.mid")?;
@@ -10,18 +11,21 @@ let roundtrip_midi = tsq1::convert_tsq_to_midi_vec(&tsq)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Use `Sequence::decode`, edit its tracks, maps, anchors, markers, or unknown
+chunks, then call `Sequence::encode` for lossless TSQ1 workflows. Enable the
+optional `serde` feature for JSON-compatible serialization.
+
 The default `std` feature enables `std::error::Error` integration and the C
 ABI helpers. The companion
 [`tsq1-ffi`](../tsq1-ffi/README.md) crate builds those helpers as a dynamic
-library. Disable the default feature to verify the allocation-backed `no_std`
-Rust library:
+library, while [`tsq1-osc`](../tsq1-osc/README.md) connects OSC events to
+`osc-ir`. Disable the default feature to verify the allocation-backed
+`no_std` Rust library:
 
 ```console
 cargo check -p tsq1-no-std-check
 ```
 
-The implemented subset and known limitations are maintained in the
-[repository README](../../README.md#implementation-status). The complete
-draft format is documented in the
+The complete draft format is documented in the
 [English specification](../../TSQ1_SPEC_v1.0_Draft.md) and
 [Japanese specification](../../TSQ1_SPEC_v1.0_Draft_JA.md).

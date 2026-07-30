@@ -1,7 +1,8 @@
-//! TSQ1 conversion primitives.
+//! Complete TSQ1 sequence model and conversion primitives.
 //!
-//! This crate converts Standard MIDI Files (SMF) to and from the TSQ1 binary
-//! timeline format. The default `std` feature also exposes standard error
+//! This crate decodes, validates, edits, and canonically encodes the TSQ1
+//! binary timeline format, and converts compatible events to and from Standard
+//! MIDI Files (SMF). The default `std` feature also exposes standard error
 //! integration and a C-compatible allocation API.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -20,6 +21,13 @@ use midly::{
     TrackEventKind,
 };
 
+mod model;
+
+pub use model::{
+    AbsoluteUnit, Event, EventKind, Marker, OscEvent, OscFormat, Sequence, SmpteFps, SmpteTiming,
+    SyncAnchor, SysexEvent, TempoEntry, TimeDomain, Track, UnknownChunk,
+};
+
 /// Error type for TSQ1 conversions.
 #[derive(Debug)]
 pub enum Error {
@@ -31,6 +39,15 @@ pub enum Error {
     DataOverflow(&'static str),
     /// Invalid or malformed TSQ input data.
     Invalid(&'static str),
+    /// Invalid data at a byte offset in the TSQ1 input.
+    InvalidAt {
+        /// Zero-based byte offset.
+        offset: usize,
+        /// Description of the invalid data.
+        message: &'static str,
+    },
+    /// A requested conversion has no valid timing mapping.
+    TimeMapping(&'static str),
 }
 
 impl From<midly::Error> for Error {
@@ -46,6 +63,10 @@ impl fmt::Display for Error {
             Error::Unsupported(msg) => write!(f, "unsupported input: {msg}"),
             Error::DataOverflow(msg) => write!(f, "data overflow: {msg}"),
             Error::Invalid(msg) => write!(f, "invalid input: {msg}"),
+            Error::InvalidAt { offset, message } => {
+                write!(f, "invalid input at byte {offset}: {message}")
+            }
+            Error::TimeMapping(msg) => write!(f, "time mapping error: {msg}"),
         }
     }
 }
@@ -56,68 +77,285 @@ impl std::error::Error for Error {}
 /// Convert SMF (Standard MIDI File) bytes into a TSQ1 binary buffer.
 pub fn convert_midi_to_tsq_vec(midi_data: &[u8]) -> Result<Vec<u8>, Error> {
     let smf = Smf::parse(midi_data)?;
-    convert_smf_to_tsq(&smf)
+    sequence_from_smf(&smf)?.encode()
 }
 
 /// Convert TSQ1 bytes into a Standard MIDI File binary buffer.
 pub fn convert_tsq_to_midi_vec(tsq_data: &[u8]) -> Result<Vec<u8>, Error> {
-    let smf = convert_tsq_to_smf(tsq_data)?;
+    let sequence = Sequence::decode(tsq_data)?;
+    sequence_to_midi(&sequence)
+}
+
+fn sequence_from_smf(smf: &Smf<'_>) -> Result<Sequence, Error> {
+    if smf.tracks.len() > u16::MAX as usize {
+        return Err(Error::DataOverflow("too many tracks"));
+    }
+    let (ppq, domain, smpte_timing) = match smf.header.timing {
+        Timing::Metrical(ppq) => (ppq.as_int(), TimeDomain::Musical, None),
+        Timing::Timecode(fps, subframes) => {
+            if subframes == 0 {
+                return Err(Error::Invalid("SMPTE subframes must be greater than zero"));
+            }
+            (
+                480,
+                TimeDomain::Absolute,
+                Some(SmpteTiming {
+                    fps: smpte_fps_from_midly(fps),
+                    subframes,
+                }),
+            )
+        }
+    };
+    let mut sequence = Sequence::new(ppq);
+    sequence.smpte_timing = smpte_timing;
+
+    for source_track in &smf.tracks {
+        let mut track = Track::default();
+        let mut musical_position = 0u64;
+        let mut timecode_remainder = 0u128;
+        for source_event in source_track {
+            let source_delta = u64::from(source_event.delta.as_int());
+            let delta = match smpte_timing {
+                Some(timing) => smpte_ticks_to_absolute_delta(
+                    source_delta,
+                    timing,
+                    sequence.absolute_unit,
+                    &mut timecode_remainder,
+                )?,
+                None => source_delta,
+            };
+            if domain == TimeDomain::Musical {
+                musical_position = musical_position
+                    .checked_add(delta)
+                    .ok_or(Error::DataOverflow("musical position exceeds u64"))?;
+                if let TrackEventKind::Meta(MetaMessage::Tempo(value)) = &source_event.kind {
+                    sequence.tempo_map.push(TempoEntry {
+                        tick: musical_position,
+                        microseconds_per_quarter: value.as_int(),
+                    });
+                }
+            }
+            track.events.push(Event {
+                delta,
+                domain,
+                kind: event_kind_from_midly(&source_event.kind),
+            });
+        }
+        sequence.tracks.push(track);
+    }
+    sequence.tempo_map.sort_by_key(|entry| entry.tick);
+    sequence.tempo_map.dedup_by_key(|entry| entry.tick);
+    Ok(sequence)
+}
+
+fn event_kind_from_midly(kind: &TrackEventKind<'_>) -> EventKind {
+    match kind {
+        TrackEventKind::Midi { channel, message } => {
+            let status = midi_status_byte(*channel, message);
+            let (data1, data2) = midi_message_bytes(message);
+            EventKind::Midi([status, data1, data2.unwrap_or(0)])
+        }
+        TrackEventKind::Meta(meta) => {
+            let (type_id, data) = meta_payload(meta);
+            EventKind::Meta {
+                type_id,
+                data: data.into_owned(),
+            }
+        }
+        TrackEventKind::SysEx(data) => EventKind::Sysex(SysexEvent {
+            status: 0xF0,
+            data: data.to_vec(),
+        }),
+        TrackEventKind::Escape(data) => EventKind::Sysex(SysexEvent {
+            status: 0xF7,
+            data: data.to_vec(),
+        }),
+    }
+}
+
+fn sequence_to_midi(sequence: &Sequence) -> Result<Vec<u8>, Error> {
+    let use_smpte = sequence.smpte_timing.is_some()
+        && sequence
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .all(|event| event.domain == TimeDomain::Absolute);
+    let timing = if use_smpte {
+        let timing = sequence.smpte_timing.expect("checked above");
+        Timing::Timecode(smpte_fps_to_midly(timing.fps), timing.subframes)
+    } else {
+        let ppq = u15::try_from(sequence.ppq)
+            .ok_or(Error::Unsupported("PPQ exceeds SMF metrical timing range"))?;
+        Timing::Metrical(ppq)
+    };
+
+    let mut tracks = Vec::new();
+    for source_track in &sequence.tracks {
+        let positioned = position_events(sequence, source_track, use_smpte)?;
+        let mut previous = 0u64;
+        let mut track = Vec::new();
+        for (position, _, event) in positioned {
+            let delta = position
+                .checked_sub(previous)
+                .ok_or(Error::Invalid("events are not ordered"))?;
+            let delta_u32 =
+                u32::try_from(delta).map_err(|_| Error::DataOverflow("MIDI delta exceeds u32"))?;
+            let delta = u28::try_from(delta_u32)
+                .ok_or(Error::DataOverflow("MIDI delta exceeds SMF limits"))?;
+            track.push(TrackEvent {
+                delta,
+                kind: midly_kind_from_event(&event.kind)?,
+            });
+            previous = position;
+        }
+        tracks.push(track);
+    }
+
+    let format = if tracks.len() <= 1 {
+        Format::SingleTrack
+    } else {
+        Format::Parallel
+    };
+    let smf = Smf {
+        header: Header::new(format, timing),
+        tracks,
+    };
     let mut out = Vec::new();
     smf.write(&mut out)
         .map_err(|_| Error::Invalid("failed to encode SMF"))?;
     Ok(out)
 }
 
-const FLAG_SYSEX_STATUS_IN_PAYLOAD: u16 = 0x0001;
-
-fn convert_smf_to_tsq(smf: &Smf<'_>) -> Result<Vec<u8>, Error> {
-    let ppq = match smf.header.timing {
-        Timing::Metrical(metrical) => metrical.as_int(),
-        Timing::Timecode(_, _) => return Err(Error::Unsupported("SMPTE timecode timing")),
-    };
-
-    if smf.tracks.len() > u16::MAX as usize {
-        return Err(Error::DataOverflow("too many tracks"));
+fn position_events<'a>(
+    sequence: &Sequence,
+    track: &'a Track,
+    use_smpte: bool,
+) -> Result<Vec<(u64, usize, &'a Event)>, Error> {
+    let mut musical = 0u64;
+    let mut absolute = 0u64;
+    let mut result = Vec::with_capacity(track.events.len());
+    for (index, event) in track.events.iter().enumerate() {
+        let domain_position = match event.domain {
+            TimeDomain::Musical => {
+                musical = musical
+                    .checked_add(event.delta)
+                    .ok_or(Error::DataOverflow("musical position exceeds u64"))?;
+                musical
+            }
+            TimeDomain::Absolute => {
+                absolute = absolute
+                    .checked_add(event.delta)
+                    .ok_or(Error::DataOverflow("absolute position exceeds u64"))?;
+                absolute
+            }
+        };
+        let position = if use_smpte {
+            absolute_to_smpte_ticks(
+                domain_position,
+                sequence.smpte_timing.expect("checked by caller"),
+                sequence.absolute_unit,
+            )?
+        } else {
+            match event.domain {
+                TimeDomain::Musical => domain_position,
+                TimeDomain::Absolute => sequence.absolute_to_tick(domain_position)?,
+            }
+        };
+        result.push((position, index, event));
     }
-
-    let sysex_present = smf.tracks.iter().any(|track| {
-        track.iter().any(|event| {
-            matches!(
-                &event.kind,
-                TrackEventKind::SysEx(_) | TrackEventKind::Escape(_)
-            )
-        })
-    });
-
-    let mut out = Vec::new();
-    let flags = if sysex_present {
-        FLAG_SYSEX_STATUS_IN_PAYLOAD
-    } else {
-        0
-    };
-    write_header(&mut out, ppq, smf.tracks.len() as u16, flags);
-
-    for track in smf.tracks.iter() {
-        let mut track_buf = Vec::new();
-        for event in track {
-            encode_event(
-                event.delta.as_int() as u64,
-                &event.kind,
-                &mut track_buf,
-                sysex_present,
-            )?;
-        }
-        if track_buf.len() > u32::MAX as usize {
-            return Err(Error::DataOverflow("track chunk too large"));
-        }
-        out.extend_from_slice(b"TRK ");
-        out.extend_from_slice(&(track_buf.len() as u32).to_le_bytes());
-        out.extend_from_slice(&track_buf);
-    }
-
-    Ok(out)
+    result.sort_by_key(|(position, index, _)| (*position, *index));
+    Ok(result)
 }
 
+fn midly_kind_from_event<'a>(kind: &'a EventKind) -> Result<TrackEventKind<'a>, Error> {
+    match kind {
+        EventKind::Midi(bytes) => {
+            let mut data = &bytes[..];
+            parse_midi_event(&mut data)
+        }
+        EventKind::Meta { type_id, data } => {
+            Ok(TrackEventKind::Meta(meta_from_payload(*type_id, data)?))
+        }
+        EventKind::Sysex(sysex) => match sysex.status {
+            0xF0 => Ok(TrackEventKind::SysEx(&sysex.data)),
+            0xF7 => Ok(TrackEventKind::Escape(&sysex.data)),
+            _ => Err(Error::Invalid("invalid SysEx status")),
+        },
+        EventKind::Osc(_) => Err(Error::Unsupported(
+            "OSC events cannot be represented in Standard MIDI Files",
+        )),
+        EventKind::Custom { .. } => Err(Error::Unsupported(
+            "custom events cannot be represented in Standard MIDI Files",
+        )),
+    }
+}
+
+fn smpte_fps_from_midly(fps: Fps) -> SmpteFps {
+    match fps {
+        Fps::Fps24 => SmpteFps::Fps24,
+        Fps::Fps25 => SmpteFps::Fps25,
+        Fps::Fps29 => SmpteFps::Fps29Drop,
+        Fps::Fps30 => SmpteFps::Fps30,
+    }
+}
+
+fn smpte_fps_to_midly(fps: SmpteFps) -> Fps {
+    match fps {
+        SmpteFps::Fps24 => Fps::Fps24,
+        SmpteFps::Fps25 => Fps::Fps25,
+        SmpteFps::Fps29Drop => Fps::Fps29,
+        SmpteFps::Fps30 => Fps::Fps30,
+    }
+}
+
+fn smpte_ticks_to_absolute_delta(
+    ticks: u64,
+    timing: SmpteTiming,
+    unit: AbsoluteUnit,
+    remainder: &mut u128,
+) -> Result<u64, Error> {
+    let (fps_numerator, fps_denominator) = timing.fps.ratio();
+    let units_per_second = match unit {
+        AbsoluteUnit::Microseconds => 1_000_000u128,
+        AbsoluteUnit::Nanoseconds => 1_000_000_000u128,
+    };
+    let numerator = u128::from(ticks)
+        .checked_mul(units_per_second)
+        .and_then(|value| value.checked_mul(u128::from(fps_denominator)))
+        .and_then(|value| value.checked_add(*remainder))
+        .ok_or(Error::DataOverflow("SMPTE conversion exceeds u128"))?;
+    let denominator = u128::from(fps_numerator) * u128::from(timing.subframes);
+    let delta = numerator / denominator;
+    *remainder = numerator % denominator;
+    u64::try_from(delta).map_err(|_| Error::DataOverflow("absolute delta exceeds u64"))
+}
+
+fn absolute_to_smpte_ticks(
+    position: u64,
+    timing: SmpteTiming,
+    unit: AbsoluteUnit,
+) -> Result<u64, Error> {
+    let (fps_numerator, fps_denominator) = timing.fps.ratio();
+    let units_per_second = match unit {
+        AbsoluteUnit::Microseconds => 1_000_000u128,
+        AbsoluteUnit::Nanoseconds => 1_000_000_000u128,
+    };
+    let numerator = u128::from(position)
+        .checked_mul(u128::from(fps_numerator))
+        .and_then(|value| value.checked_mul(u128::from(timing.subframes)))
+        .ok_or(Error::DataOverflow("SMPTE conversion exceeds u128"))?;
+    let denominator = units_per_second * u128::from(fps_denominator);
+    let rounded = numerator
+        .checked_add(denominator / 2)
+        .ok_or(Error::DataOverflow("SMPTE rounding exceeds u128"))?
+        / denominator;
+    u64::try_from(rounded).map_err(|_| Error::DataOverflow("SMPTE position exceeds u64"))
+}
+
+#[cfg(test)]
+const FLAG_SYSEX_STATUS_IN_PAYLOAD: u16 = 0x0001;
+
+#[cfg(test)]
 fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
     const HEADER_SIZE: usize = 14;
     if tsq_data.len() < HEADER_SIZE {
@@ -182,6 +420,7 @@ fn convert_tsq_to_smf<'a>(tsq_data: &'a [u8]) -> Result<Smf<'a>, Error> {
     })
 }
 
+#[cfg(test)]
 fn parse_track<'a>(
     mut data: &'a [u8],
     sysex_with_status: bool,
@@ -288,6 +527,7 @@ fn parse_midi_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
     Ok(TrackEventKind::Midi { channel, message })
 }
 
+#[cfg(test)]
 fn parse_meta_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error> {
     let ty = read_u8(data)?;
     let len = read_vlq(data)?;
@@ -298,6 +538,7 @@ fn parse_meta_event<'a>(data: &mut &'a [u8]) -> Result<TrackEventKind<'a>, Error
     Ok(TrackEventKind::Meta(meta))
 }
 
+#[cfg(test)]
 fn parse_sysex_event<'a>(
     data: &mut &'a [u8],
     has_status: bool,
@@ -418,6 +659,7 @@ fn read_u8(data: &mut &[u8]) -> Result<u8, Error> {
     Ok(byte)
 }
 
+#[cfg(test)]
 fn take_slice<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
     if data.len() < len {
         return Err(Error::Invalid("payload exceeds remaining track data"));
@@ -427,6 +669,7 @@ fn take_slice<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
     Ok(prefix)
 }
 
+#[cfg(test)]
 fn read_vlq(data: &mut &[u8]) -> Result<u64, Error> {
     let mut value = 0u64;
     let mut read = 0usize;
@@ -444,6 +687,7 @@ fn read_vlq(data: &mut &[u8]) -> Result<u64, Error> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn write_header(out: &mut Vec<u8>, ppq: u16, track_count: u16, flags: u16) {
     out.extend_from_slice(b"TSQ1");
     out.extend_from_slice(&1u16.to_le_bytes());
@@ -454,6 +698,7 @@ fn write_header(out: &mut Vec<u8>, ppq: u16, track_count: u16, flags: u16) {
     out.extend_from_slice(&flags.to_le_bytes());
 }
 
+#[cfg(test)]
 fn encode_event(
     delta: u64,
     kind: &TrackEventKind<'_>,
@@ -579,6 +824,7 @@ fn meta_payload<'a>(meta: &MetaMessage<'a>) -> (u8, Cow<'a, [u8]>) {
     }
 }
 
+#[cfg(test)]
 fn write_vlq(mut value: u64, out: &mut Vec<u8>) {
     let mut buffer = [0u8; 10];
     let mut index = buffer.len();
@@ -1142,5 +1388,113 @@ mod tests {
             &roundtrip_track1[3].kind,
             TrackEventKind::Meta(MetaMessage::EndOfTrack)
         ));
+    }
+
+    #[test]
+    fn smpte_divisions_roundtrip_through_absolute_events() {
+        for fps in [Fps::Fps24, Fps::Fps25, Fps::Fps29, Fps::Fps30] {
+            let track = vec![
+                TrackEvent {
+                    delta: 0.into(),
+                    kind: TrackEventKind::Midi {
+                        channel: u4::from(0),
+                        message: MidiMessage::NoteOn {
+                            key: u7::from(60),
+                            vel: u7::from(100),
+                        },
+                    },
+                },
+                TrackEvent {
+                    delta: u28::from(240),
+                    kind: TrackEventKind::Midi {
+                        channel: u4::from(0),
+                        message: MidiMessage::NoteOff {
+                            key: u7::from(60),
+                            vel: u7::from(0),
+                        },
+                    },
+                },
+                TrackEvent {
+                    delta: 0.into(),
+                    kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                },
+            ];
+            let smf = Smf {
+                header: Header::new(Format::SingleTrack, Timing::Timecode(fps, 80)),
+                tracks: vec![track],
+            };
+            let mut midi = Vec::new();
+            smf.write(&mut midi).expect("write SMPTE SMF");
+
+            let tsq = convert_midi_to_tsq_vec(&midi).expect("convert SMPTE SMF");
+            let sequence = Sequence::decode(&tsq).expect("decode sequence");
+            assert_eq!(
+                sequence.smpte_timing,
+                Some(SmpteTiming {
+                    fps: smpte_fps_from_midly(fps),
+                    subframes: 80,
+                })
+            );
+            assert!(sequence.tracks[0]
+                .events
+                .iter()
+                .all(|event| event.domain == TimeDomain::Absolute));
+
+            let roundtrip = convert_tsq_to_midi_vec(&tsq).expect("convert back to SMPTE SMF");
+            let parsed = Smf::parse(&roundtrip).expect("parse roundtrip");
+            assert_eq!(parsed.header.timing, Timing::Timecode(fps, 80));
+            assert_eq!(parsed.tracks[0][1].delta.as_int().abs_diff(240), 0);
+        }
+    }
+
+    #[test]
+    fn absolute_events_map_to_metrical_midi_with_sync_anchors() {
+        let mut sequence = Sequence::new(480);
+        sequence.sync_anchors = vec![
+            SyncAnchor { tick: 0, time: 0 },
+            SyncAnchor {
+                tick: 960,
+                time: 1_000_000,
+            },
+        ];
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 500_000,
+                    domain: TimeDomain::Absolute,
+                    kind: EventKind::Midi([0x90, 60, 100]),
+                },
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Absolute,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        assert_eq!(parsed.header.timing, Timing::Metrical(u15::from(480)));
+        assert_eq!(parsed.tracks[0][0].delta.as_int(), 480);
+    }
+
+    #[test]
+    fn non_midi_events_are_not_silently_dropped() {
+        let mut sequence = Sequence::new(480);
+        sequence.tracks.push(Track {
+            events: vec![Event {
+                delta: 0,
+                domain: TimeDomain::Musical,
+                kind: EventKind::Custom {
+                    type_id: 1,
+                    data: vec![1],
+                },
+            }],
+        });
+        let error = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
     }
 }

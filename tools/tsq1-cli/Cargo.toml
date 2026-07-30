@@ -12,7 +12,8 @@ readme = "README.md"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-tsq1 = { path = "../../crates/tsq1" }
+serde_json.workspace = true
+tsq1 = { path = "../../crates/tsq1", features = ["serde"] }
 
 [lints]
 workspace = true

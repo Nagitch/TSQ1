@@ -25,7 +25,16 @@ v1.0 draft without historical notes so that implementers can focus on the latest
 | 0x08 | 1 | `u8` | AbsUnit | 0 = Microseconds, 1 = Nanoseconds |
 | 0x09 | 1 | - | Reserved | Must be 0 |
 | 0x0A | 2 | `u16` | TrackCount | Advisory track count |
-| 0x0C | 2 | `u16` | Flags | Reserved for future use (0) |
+| 0x0C | 2 | `u16` | Flags | Encoding flags described below |
+
+Header flags:
+
+- `bit 0` (`0x0001`): SysEx payloads include their leading `0xF0` or `0xF7`
+  status byte.
+- `bit 1` (`0x0002`): MIDI messages use the canonical fixed three-byte
+  payload. Writers of this draft must set this bit.
+- Other bits are reserved. Readers must preserve unknown bits when rewriting a
+  document and otherwise ignore them.
 
 ---
 
@@ -36,10 +45,11 @@ v1.0 draft without historical notes so that implementers can focus on the latest
 - `"TRK "`: Event stream chunk (musical and absolute events)
 - `"TMAP"`: Tempo map entries `(tick:u64, us_per_qn:u32)*`
 - `"SYNC"`: Absolute anchors `(tick:u64, time_abs:u64)*` where `time_abs` uses `AbsUnit`
- - `"MARK"`: Locators/markers for arrangement sections and cues
+- `"MARK"`: Locators/markers for arrangement sections and cues
+- `"SMPF"`: Original SMF SMPTE division `[fps:u8][subframes:u8]`
 
 Implementations may introduce additional chunks; unknown chunk IDs must be skipped by
-using the declared length.
+using the declared length. Lossless editors should retain unknown chunks byte-for-byte.
 
 ---
 
@@ -73,7 +83,8 @@ using the declared length.
   - `0x01 = MSGPACK`: `{ "k": "msg"|"bun", "p": "/foo", "t": ",ifs", "a": [...], "ntp": u64? }`
   - `0x02 = CBOR`: Same schema encoded in CBOR
   - `0x20–0x7F`: Reserved
-- Validation guidelines for RAW: first byte `'/'` or `'#'`, maintain 4-byte alignment where applicable
+- RAW validation: the first byte is `'/'` or `'#'` and the packet length is
+  four-byte aligned
 - Emission time derives from `Header.Domain` and `ΔTime`; payload timetags remain untouched
 - No fragmentation: one TSQ1 event encapsulates one OSC message or bundle
 
@@ -81,7 +92,10 @@ using the declared length.
 ```
 [Status:1][Data1:1][Data2:1]
 ```
-- No running status; every MIDI event stores all three bytes
+- No running status; every canonical MIDI event stores all three bytes.
+- Program Change (`0xCn`) and Channel Pressure (`0xDn`) set `Data2` to zero.
+- For backward compatibility, readers may accept two-byte `0xCn`/`0xDn`
+  messages when header flag `0x0002` is clear.
 
 ### 4.3 Meta (`EventKind = 0x02`)
 ```
@@ -91,8 +105,13 @@ using the declared length.
 
 ### 4.4 SysEx (`EventKind = 0x03`)
 ```
-[Length:VLQ][Data:N]  // excludes 0xF0/0xF7 framing
+[Length:VLQ][Data:N]
 ```
+- With header flag `0x0001`, `Data` begins with the `0xF0` or `0xF7` status
+  byte and `Length` includes it. Canonical writers use this form so escape and
+  continuation events round-trip.
+- With the flag clear, the legacy form excludes framing and readers assume
+  `0xF0`.
 
 ### 4.5 Custom (`EventKind = 0x7E`)
 ```
@@ -102,7 +121,16 @@ using the declared length.
 
 ---
 
-## 5. SYNC Chunk
+## 5. Timing Chunks
+
+### 5.1 TMAP
+```
+"TMAP"[len:u32] { [tick:u64][us_per_qn:u32] }*
+```
+- Entries must be strictly increasing by `tick`.
+- `us_per_qn` is microseconds per quarter note, matching SMF tempo metadata.
+
+### 5.2 SYNC
 ```
 "SYNC"[len:u32] { [tick:u64][time_abs:u64] }*
 ```
@@ -110,12 +138,23 @@ using the declared length.
 - `time_abs`: Absolute position expressed in `AbsUnit`
 - Provides tick ↔ time conversion via linear interpolation between anchors
 - `time_abs` expresses elapsed sequence time, not wall-clock timestamps
+- Both `tick` and `time_abs` must be strictly increasing.
+
+### 5.3 SMPF
+```
+"SMPF"[len=2:u32][fps:u8][subframes:u8]
+```
+- Retains the source SMF SMPTE division for round-trip export.
+- `fps` is `24`, `25`, `29` (29.97 drop-frame), or `30`.
+- `subframes` must be non-zero.
+- SMPTE-imported track deltas are represented in the Absolute domain; `SMPF`
+  records how to reconstruct the original division.
 
 ---
 
 ## 6. MARK Chunk (Locators)
 ```
-"MARK"[len:u32] { [pos_kind:u8][pos:u64][name_len:VLQ][name:N][class:u8][color_rgba:u32]? }*
+"MARK"[len:u32] { [pos_kind:u8][pos:u64][name_len:VLQ][name:N][class:u8][marker_flags:u8][color_rgba:u32]? }*
 ```
 - Purpose: store non-audio, non-control metadata for arrangement navigation such as Ableton Live-style locators (Intro, Breakdown, Drop, etc.).
 - Positioning:
@@ -130,7 +169,8 @@ using the declared length.
     - `0x20 = Cue`
     - `0x7F = Custom`
 - Color (optional):
-  - `color_rgba` MAY be present; it is optional and independent of `class`.
+  - `marker_flags.bit0 = 1` means `color_rgba` is present. Other marker flag
+    bits are reserved and must be zero.
   - Encoded as little-endian `u32` RGBA (`0xAARRGGBB`). Consumers SHOULD ignore if unsupported.
 - Ordering: entries must be sorted by `pos` within each `pos_kind`.
 - Uniqueness: multiple locators may share the same position; consumers should handle duplicates.
@@ -147,39 +187,41 @@ pos      = 1024  // ticks from start
 name_len = VLQ(len("Generic Marker"))
 name     = "Generic Marker"
 class    = 0x00  // Generic
+marker_flags = 0x00
 
 // Absolute locator at 90s, labeled "Cue", with optional color
 pos_kind   = 1  // Absolute
 pos        = 90_000_000  // assuming AbsUnit=μs
-name_len   = VLQ(len("Drop"))
+name_len   = VLQ(len("Cue"))
 name       = "Cue"
 class      = 0x20  // Cue
+marker_flags = 0x01
 color_rgba = 0xFF00FF00  // optional opaque green
 ```
 
-## 6. Implementation Notes
-- Use little endian encoding consistently
 ## 7. Implementation Notes
+- Use little endian encoding consistently
+- VLQs are limited to ten bytes and the `u64` range
 - Practical PPQ values: 480 or 960; absolute μs is common, ns is optional for high precision
 - Maintaining per-bar or per-second indexes improves seek performance
 
 ---
 
 ## 8. Examples
-### 7.1 Musical event after 240 ticks (OSC RAW)
+### 8.1 Musical event after 240 ticks (OSC RAW)
 ```
 Header = 0b0_0000000 (Domain = Musical, Kind = OSC)
-ΔTime  = 0x81 0x10  // 240
+ΔTime  = 0x81 0x70  // 240
 Payload:
   OscFormat = 0x00  // RAW
-  Length    = 0x15
-  Data      = "/light/flash\0\0\0,i\0\0\0\0\0\1"
+  Length    = 0x18
+  Data      = OSC packet for address "/light/flash", type tag ",i", argument 1
 ```
 
-### 7.2 Absolute event after 150,000 μs (MIDI)
+### 8.2 Absolute event after 150,000 μs (MIDI)
 ```
 Header = 0b1_0000001 (Domain = Absolute, Kind = MIDI)
-ΔTime  = 0x83 0x58  // 150,000 (μs)
+ΔTime  = 0x89 0x93 0x70  // 150,000 (μs)
 Payload: [0x90, 0x3C, 0x64]
 ```
 
