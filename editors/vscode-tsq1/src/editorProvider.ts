@@ -150,6 +150,10 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
   <div id="diagnostic" class="diagnostic" role="alert"></div>
   <div id="cards" class="cards"></div>
   <section>
+    <h2>Timeline metadata</h2>
+    <div id="metadata"></div>
+  </section>
+  <section>
     <h2>Tracks and events</h2>
     <div class="toolbar">
       <button id="add-track" class="secondary">Add track</button>
@@ -177,6 +181,7 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
     const vscode = acquireVsCodeApi();
     let state = ${initial};
     const cards = document.getElementById("cards");
+    const metadata = document.getElementById("metadata");
     const events = document.getElementById("events");
     const json = document.getElementById("model-json");
     const diagnostic = document.getElementById("diagnostic");
@@ -199,8 +204,43 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
       cards.append(item);
     }
 
+    function renderTable(title, headers, rows) {
+      const heading = document.createElement("h3");
+      heading.textContent = title + " · " + rows.length;
+      metadata.append(heading);
+      if (rows.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No entries";
+        metadata.append(empty);
+        return;
+      }
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      headers.forEach((header) => {
+        const cell = document.createElement("th");
+        cell.textContent = header;
+        headRow.append(cell);
+      });
+      head.append(headRow);
+      const body = document.createElement("tbody");
+      rows.forEach((values) => {
+        const row = document.createElement("tr");
+        values.forEach((value) => {
+          const cell = document.createElement("td");
+          cell.textContent = String(value);
+          row.append(cell);
+        });
+        body.append(row);
+      });
+      table.append(head, body);
+      metadata.append(table);
+    }
+
     function refresh(resetText) {
       cards.replaceChildren();
+      metadata.replaceChildren();
       events.replaceChildren();
       showDiagnostic(state.error);
       if (!state.model) {
@@ -216,12 +256,52 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
       const model = state.model;
       const eventCount = model.tracks.reduce((sum, track) => sum + track.events.length, 0);
       card("PPQ", model.ppq);
+      card("Absolute unit", model.absolute_unit);
+      card("Flags", "0x" + model.flags.toString(16).padStart(4, "0"));
       card("Tracks", model.tracks.length);
       card("Events", eventCount);
       card("Tempo entries", model.tempo_map.length);
       card("Sync anchors", model.sync_anchors.length);
       card("Markers", model.markers.length);
+      card(
+        "SMPTE source",
+        model.smpte_timing
+          ? model.smpte_timing.fps + " / " + model.smpte_timing.subframes
+          : "None"
+      );
       if (resetText) json.value = JSON.stringify(model, null, 2);
+
+      renderTable(
+        "Tempo map",
+        ["Tick", "µs / quarter"],
+        model.tempo_map.map((entry) => [entry.tick, entry.microseconds_per_quarter])
+      );
+      renderTable(
+        "Sync anchors",
+        ["Tick", "Absolute time"],
+        model.sync_anchors.map((anchor) => [anchor.tick, anchor.time])
+      );
+      renderTable(
+        "Markers",
+        ["Domain", "Position", "Name", "Class", "Color"],
+        model.markers.map((marker) => [
+          marker.domain,
+          marker.position,
+          marker.name,
+          marker.class,
+          marker.color_rgba === null
+            ? "None"
+            : "0x" + marker.color_rgba.toString(16).padStart(8, "0")
+        ])
+      );
+      renderTable(
+        "Unknown chunks",
+        ["ID", "Bytes"],
+        model.unknown_chunks.map((chunk) => [
+          String.fromCharCode(...chunk.id),
+          chunk.data.length
+        ])
+      );
 
       model.tracks.forEach((track, trackIndex) => {
         const heading = document.createElement("h3");

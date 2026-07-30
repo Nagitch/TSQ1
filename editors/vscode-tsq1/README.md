@@ -17,6 +17,7 @@ which decoding failed and the original bytes are not overwritten.
 ```console
 npm ci
 npm run check
+npm run lint
 npm test
 npm run vsix
 ```

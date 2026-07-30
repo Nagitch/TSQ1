@@ -14,10 +14,11 @@ function fixtureBytes(): Uint8Array {
   return Uint8Array.from(Buffer.from(fixture, "hex"));
 }
 
-test("TypeScript codec reproduces the Rust canonical fixture", () => {
+void test("TypeScript codec reproduces the Rust canonical fixture", () => {
   const bytes = fixtureBytes();
   const model = decodeSequence(bytes);
   assert.deepEqual(encodeSequence(model), bytes);
+  assert.deepEqual(decodeSequence(encodeSequence(model)), model);
   assert.deepEqual(
     new Set(model.tracks.flatMap((track) => track.events.map((event) => event.kind.kind))),
     new Set(["osc", "midi", "meta", "sysex", "custom"]),
@@ -29,7 +30,7 @@ test("TypeScript codec reproduces the Rust canonical fixture", () => {
   assert.equal(model.unknown_chunks.length, 1);
 });
 
-test("u64 values beyond JavaScript safe integers remain exact", () => {
+void test("u64 values beyond JavaScript safe integers remain exact", () => {
   const model = emptySequence();
   model.markers.push({
     domain: "absolute",
@@ -42,7 +43,7 @@ test("u64 values beyond JavaScript safe integers remain exact", () => {
   assert.equal(decoded.markers[0]?.position, "9007199254740993");
 });
 
-test("malformed input reports a byte offset", () => {
+void test("malformed input reports a byte offset", () => {
   const truncated = fixtureBytes().subarray(0, 19);
   assert.throws(
     () => decodeSequence(truncated),
@@ -50,7 +51,7 @@ test("malformed input reports a byte offset", () => {
   );
 });
 
-test("semantic decode errors also identify a source byte offset", () => {
+void test("semantic decode errors also identify a source byte offset", () => {
   const invalidRaw = fixtureBytes();
   invalidRaw[31] = 0;
   assert.throws(
@@ -59,7 +60,7 @@ test("semantic decode errors also identify a source byte offset", () => {
   );
 });
 
-test("all event kinds can be created, encoded, and removed", () => {
+void test("all event kinds can be created, encoded, and removed", () => {
   const model = emptySequence();
   model.tracks[0]!.events = [
     {

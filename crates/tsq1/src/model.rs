@@ -1042,4 +1042,33 @@ mod tests {
             Err(Error::InvalidAt { offset: 8, .. })
         ));
     }
+
+    #[test]
+    fn malformed_vlq_is_rejected_without_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TSQ1");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&480u16.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&FLAG_FIXED_MIDI_WIDTH.to_le_bytes());
+        bytes.extend_from_slice(b"TRK ");
+        bytes.extend_from_slice(&11u32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&[0x80; 10]);
+        assert!(matches!(
+            Sequence::decode(&bytes),
+            Err(Error::InvalidAt { offset: 23, .. })
+        ));
+    }
+
+    #[test]
+    fn non_monotonic_sync_anchors_are_rejected() {
+        let mut sequence = all_features_sequence();
+        sequence.sync_anchors.push(SyncAnchor {
+            tick: 480,
+            time: 750_000,
+        });
+        assert!(matches!(sequence.validate(), Err(Error::Invalid(_))));
+    }
 }

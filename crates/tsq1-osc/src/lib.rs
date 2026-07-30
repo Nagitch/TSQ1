@@ -104,5 +104,11 @@ mod tests {
         assert!(raw_event(TimeDomain::Musical, 0, vec![0, 1, 2, 3]).is_err());
         assert!(raw_event(TimeDomain::Musical, 0, b"/bad".to_vec()).is_ok());
         assert!(raw_event(TimeDomain::Musical, 0, b"/no\0\0".to_vec()).is_err());
+        let bundle =
+            raw_event(TimeDomain::Absolute, 4, b"#bundle\0".to_vec()).expect("aligned RAW bundle");
+        let EventKind::Osc(osc) = bundle.kind else {
+            panic!("expected OSC event");
+        };
+        assert_eq!(osc.data, b"#bundle\0");
     }
 }
