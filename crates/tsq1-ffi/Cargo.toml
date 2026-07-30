@@ -1,0 +1,21 @@
+[package]
+name = "tsq1-ffi"
+description = "C-compatible dynamic library for TSQ1 conversion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+
+[lib]
+name = "tsq1"
+crate-type = ["cdylib"]
+doc = false
+
+[dependencies]
+tsq1-core = { package = "tsq1", path = "../tsq1" }
+
+[lints]
+workspace = true
