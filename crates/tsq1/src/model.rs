@@ -4,6 +4,56 @@ use core::convert::TryFrom;
 
 use crate::Error;
 
+#[cfg(feature = "serde")]
+mod js_safe_u64 {
+    use alloc::string::String;
+
+    const MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() && *value > MAX_SAFE_INTEGER {
+            serializer.collect_str(value)
+        } else {
+            serializer.serialize_u64(*value)
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !deserializer.is_human_readable() {
+            return <u64 as serde::Deserialize>::deserialize(deserializer);
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Number(u64),
+            Decimal(String),
+        }
+
+        match <Representation as serde::Deserialize>::deserialize(deserializer)? {
+            Representation::Number(value) => Ok(value),
+            Representation::Decimal(value)
+                if !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && (value.len() == 1 || !value.starts_with('0')) =>
+            {
+                value
+                    .parse()
+                    .map_err(|_| serde::de::Error::custom("u64 decimal string is out of range"))
+            }
+            Representation::Decimal(_) => Err(serde::de::Error::custom(
+                "u64 string must be canonical unsigned decimal",
+            )),
+        }
+    }
+}
+
 pub(crate) const FLAG_SYSEX_STATUS_IN_PAYLOAD: u16 = 0x0001;
 pub(crate) const FLAG_FIXED_MIDI_WIDTH: u16 = 0x0002;
 
@@ -133,6 +183,7 @@ pub enum EventKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     /// Delta from the previous event in the same time domain.
+    #[cfg_attr(feature = "serde", serde(with = "js_safe_u64"))]
     pub delta: u64,
     /// Domain in which `delta` is expressed.
     pub domain: TimeDomain,
@@ -153,6 +204,7 @@ pub struct Track {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TempoEntry {
     /// Absolute musical tick.
+    #[cfg_attr(feature = "serde", serde(with = "js_safe_u64"))]
     pub tick: u64,
     /// Microseconds per quarter note.
     pub microseconds_per_quarter: u32,
@@ -163,8 +215,10 @@ pub struct TempoEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyncAnchor {
     /// Absolute musical tick.
+    #[cfg_attr(feature = "serde", serde(with = "js_safe_u64"))]
     pub tick: u64,
     /// Absolute elapsed time in the sequence's absolute unit.
+    #[cfg_attr(feature = "serde", serde(with = "js_safe_u64"))]
     pub time: u64,
 }
 
@@ -175,6 +229,7 @@ pub struct Marker {
     /// Position domain.
     pub domain: TimeDomain,
     /// Absolute position in the selected domain.
+    #[cfg_attr(feature = "serde", serde(with = "js_safe_u64"))]
     pub position: u64,
     /// UTF-8 marker label.
     pub name: String,

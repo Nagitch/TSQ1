@@ -55,6 +55,57 @@ fn inspect_emits_complete_json() {
 }
 
 #[test]
+fn inspect_emits_large_u64_values_as_decimal_strings() {
+    const LARGE: u64 = 9_007_199_254_740_993;
+
+    let mut sequence = tsq1::Sequence::new(480);
+    sequence.tracks.push(tsq1::Track {
+        events: vec![tsq1::Event {
+            delta: LARGE,
+            domain: tsq1::TimeDomain::Musical,
+            kind: tsq1::EventKind::Meta {
+                type_id: 0x2F,
+                data: Vec::new(),
+            },
+        }],
+    });
+    sequence.tempo_map.push(tsq1::TempoEntry {
+        tick: LARGE,
+        microseconds_per_quarter: 500_000,
+    });
+    sequence.sync_anchors.push(tsq1::SyncAnchor {
+        tick: LARGE,
+        time: LARGE,
+    });
+    sequence.markers.push(tsq1::Marker {
+        domain: tsq1::TimeDomain::Absolute,
+        position: LARGE,
+        name: "large".into(),
+        class: 0,
+        color_rgba: None,
+    });
+
+    let path = fixture_file("large-u64", &sequence.encode().expect("encode fixture"));
+    let output = Command::new(env!("CARGO_BIN_EXE_tsq1-cli"))
+        .args(["inspect", path.to_str().expect("UTF-8 path"), "--compact"])
+        .output()
+        .expect("run inspect");
+    fs::remove_file(path).expect("remove temporary fixture");
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let expected = LARGE.to_string();
+    assert_eq!(value["tracks"][0]["events"][0]["delta"], expected);
+    assert_eq!(value["tempo_map"][0]["tick"], expected);
+    assert_eq!(value["sync_anchors"][0]["tick"], expected);
+    assert_eq!(value["sync_anchors"][0]["time"], expected);
+    assert_eq!(value["markers"][0]["position"], expected);
+
+    let roundtrip: tsq1::Sequence = serde_json::from_value(value).expect("deserialize model");
+    assert_eq!(roundtrip, sequence);
+}
+
+#[test]
 fn validate_reports_malformed_byte_offset() {
     let path = fixture_file("invalid", b"TSQ1");
     let output = Command::new(env!("CARGO_BIN_EXE_tsq1-cli"))

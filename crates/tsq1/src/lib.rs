@@ -673,7 +673,11 @@ fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Erro
                 return Err(Error::Invalid("key signature meta must be 2 bytes"));
             }
             let sharps = data[0] as i8;
-            let is_minor = data[1] != 0;
+            let is_minor = match data[1] {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Invalid("key signature mode must be 0 or 1")),
+            };
             KeySignature(sharps, is_minor)
         }
         0x7F => SequencerSpecific(data),
@@ -1365,6 +1369,27 @@ mod tests {
             let error = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).unwrap_err();
             assert!(matches!(error, Error::Invalid(message) if message == expected));
         }
+    }
+
+    #[test]
+    fn key_signature_rejects_invalid_mode_byte() {
+        let mut sequence = Sequence::new(480);
+        sequence.tracks.push(Track {
+            events: vec![Event {
+                delta: 0,
+                domain: TimeDomain::Musical,
+                kind: EventKind::Meta {
+                    type_id: 0x59,
+                    data: vec![0, 2],
+                },
+            }],
+        });
+
+        let error = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Invalid("key signature mode must be 0 or 1")
+        ));
     }
 
     #[test]
