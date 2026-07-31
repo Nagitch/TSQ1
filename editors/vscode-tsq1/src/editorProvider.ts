@@ -3,12 +3,13 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 
 import { TsqDocument } from "./document.js";
+import { removeEventPreservingTimeline } from "./model.js";
 import type { DocumentState, Sequence } from "./model.js";
 
-interface WebviewMessage {
-  type: "ready" | "apply";
-  model?: Sequence;
-}
+type WebviewMessage =
+  | { type: "ready" }
+  | { type: "apply"; model: Sequence }
+  | { type: "removeEvent"; trackIndex: number; eventIndex: number };
 
 export class TsqEditorProvider implements vscode.CustomEditorProvider<TsqDocument> {
   private readonly editEmitter =
@@ -55,16 +56,24 @@ export class TsqEditorProvider implements vscode.CustomEditorProvider<TsqDocumen
         await panel.webview.postMessage({ type: "state", state: document.state });
         return;
       }
-      if (message.type === "apply" && message.model !== undefined) {
-        try {
+      try {
+        if (message.type === "apply") {
           document.applyModel(message.model);
-          await panel.webview.postMessage({ type: "status", message: "Changes applied" });
-        } catch (error) {
-          await panel.webview.postMessage({
-            type: "diagnostic",
-            message: error instanceof Error ? error.message : String(error),
-          });
+        } else {
+          const model = document.state.model;
+          const track = model?.tracks[message.trackIndex];
+          if (model === null || model === undefined || track === undefined) {
+            throw new RangeError("track index is outside the sequence");
+          }
+          removeEventPreservingTimeline(track, message.eventIndex);
+          document.applyModel(model);
         }
+        await panel.webview.postMessage({ type: "status", message: "Changes applied" });
+      } catch (error) {
+        await panel.webview.postMessage({
+          type: "diagnostic",
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     });
     panel.webview.html = renderEditorHtml(panel.webview, document.state);
@@ -323,8 +332,8 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
           remove.className = "secondary";
           remove.textContent = "Remove";
           remove.addEventListener("click", () => {
-            model.tracks[trackIndex].events.splice(eventIndex, 1);
-            submitModel(model);
+            showDiagnostic("");
+            vscode.postMessage({ type: "removeEvent", trackIndex, eventIndex });
           });
           action.append(remove);
           row.append(action);

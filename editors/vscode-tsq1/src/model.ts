@@ -77,6 +77,53 @@ export interface DocumentState {
   error: string | null;
 }
 
+const MAX_U64 = (1n << 64n) - 1n;
+const MAX_SAFE_U64 = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** Remove an event without changing later absolute positions in its time domain. */
+export function removeEventPreservingTimeline(track: Track, eventIndex: number): Event {
+  if (!Number.isInteger(eventIndex) || eventIndex < 0 || eventIndex >= track.events.length) {
+    throw new RangeError("event index is outside the track");
+  }
+  const removed = track.events[eventIndex]!;
+  const next = track.events
+    .slice(eventIndex + 1)
+    .find((event) => event.domain === removed.domain);
+  const combinedDelta =
+    next === undefined ? undefined : addU64(removed.delta, next.delta, "combined event delta");
+
+  track.events.splice(eventIndex, 1);
+  if (next !== undefined && combinedDelta !== undefined) {
+    next.delta = combinedDelta;
+  }
+  return removed;
+}
+
+function addU64(left: U64, right: U64, label: string): U64 {
+  const result = parseU64(left, label) + parseU64(right, label);
+  if (result > MAX_U64) {
+    throw new RangeError(`${label} exceeds u64`);
+  }
+  return result <= MAX_SAFE_U64 ? Number(result) : result.toString();
+}
+
+function parseU64(value: U64, label: string): bigint {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`${label} must be a non-negative safe integer or decimal string`);
+    }
+    return BigInt(value);
+  }
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new RangeError(`${label} must be an unsigned decimal value`);
+  }
+  const parsed = BigInt(value);
+  if (parsed > MAX_U64) {
+    throw new RangeError(`${label} exceeds u64`);
+  }
+  return parsed;
+}
+
 export function emptySequence(): Sequence {
   return {
     ppq: 480,

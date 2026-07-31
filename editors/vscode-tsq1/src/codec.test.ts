@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 import { decodeSequence, encodeSequence, FormatError } from "./codec.js";
-import { emptySequence } from "./model.js";
+import { emptySequence, removeEventPreservingTimeline, type Track } from "./model.js";
 
 function fixtureBytes(): Uint8Array {
   const fixture = readFileSync(
@@ -41,6 +41,55 @@ void test("u64 values beyond JavaScript safe integers remain exact", () => {
   });
   const decoded = decodeSequence(encodeSequence(model));
   assert.equal(decoded.markers[0]?.position, "9007199254740993");
+});
+
+void test("unknown chunk IDs preserve arbitrary four-byte values", () => {
+  const model = emptySequence();
+  model.unknown_chunks.push({ id: [0xff, 0x80, 0x00, 0x41], data: [0xde, 0xad] });
+  const encoded = encodeSequence(model);
+  const decoded = decodeSequence(encoded);
+  assert.deepEqual(decoded.unknown_chunks, model.unknown_chunks);
+  assert.deepEqual(encodeSequence(decoded), encoded);
+});
+
+void test("event removal carries delta to the next event in the same domain", () => {
+  const track: Track = {
+    events: [
+      { delta: 10, domain: "musical", kind: { kind: "midi", value: [0x90, 60, 100] } },
+      { delta: 4, domain: "absolute", kind: { kind: "custom", value: { type_id: 1, data: [] } } },
+      { delta: 20, domain: "musical", kind: { kind: "midi", value: [0x80, 60, 0] } },
+      {
+        delta: "9007199254740993",
+        domain: "absolute",
+        kind: { kind: "custom", value: { type_id: 2, data: [] } },
+      },
+    ],
+  };
+
+  removeEventPreservingTimeline(track, 0);
+  assert.deepEqual(
+    track.events.map((event) => [event.domain, event.delta]),
+    [
+      ["absolute", 4],
+      ["musical", 30],
+      ["absolute", "9007199254740993"],
+    ],
+  );
+  removeEventPreservingTimeline(track, 0);
+  assert.equal(track.events[1]?.delta, "9007199254740997");
+});
+
+void test("event removal is transactional when the carried delta overflows u64", () => {
+  const track: Track = {
+    events: [
+      { delta: "18446744073709551615", domain: "musical", kind: { kind: "midi", value: [0x90, 60, 100] } },
+      { delta: 1, domain: "musical", kind: { kind: "midi", value: [0x80, 60, 0] } },
+    ],
+  };
+  const before = structuredClone(track);
+
+  assert.throws(() => removeEventPreservingTimeline(track, 0), /exceeds u64/);
+  assert.deepEqual(track, before);
 });
 
 void test("malformed input reports a byte offset", () => {

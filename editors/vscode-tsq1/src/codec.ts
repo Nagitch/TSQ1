@@ -327,7 +327,7 @@ export function encodeSequence(sequence: Sequence): Uint8Array {
     writeChunk(output, "SMPF", payload.result());
   }
   for (const chunk of sequence.unknown_chunks) {
-    writeChunk(output, ascii(Uint8Array.from(chunk.id)), Uint8Array.from(chunk.data));
+    writeChunk(output, chunk.id, Uint8Array.from(chunk.data));
   }
   return output.result();
 }
@@ -543,10 +543,10 @@ function validateMarker(marker: Marker): void {
   }
 }
 
-function writeChunk(output: Writer, id: string, payload: Uint8Array): void {
-  const idBytes = new TextEncoder().encode(id);
+function writeChunk(output: Writer, id: string | ArrayLike<number>, payload: Uint8Array): void {
+  const idBytes = typeof id === "string" ? new TextEncoder().encode(id) : id;
   if (idBytes.length !== 4) {
-    throw new FormatError("chunk id must be four ASCII bytes");
+    throw new FormatError("chunk id must be exactly four bytes");
   }
   output.raw(idBytes);
   output.u32(payload.length);
