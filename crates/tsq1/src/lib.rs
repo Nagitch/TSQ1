@@ -87,6 +87,11 @@ pub fn convert_tsq_to_midi_vec(tsq_data: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 fn sequence_from_smf(smf: &Smf<'_>) -> Result<Sequence, Error> {
+    if smf.header.format == Format::Sequential {
+        return Err(Error::Unsupported(
+            "sequential SMF tracks require independent tempo maps",
+        ));
+    }
     if smf.tracks.len() > u16::MAX as usize {
         return Err(Error::DataOverflow("too many tracks"));
     }
@@ -1339,6 +1344,36 @@ mod tests {
                 microseconds_per_quarter: 400_000,
             }]
         );
+    }
+
+    #[test]
+    fn sequential_midi_with_independent_tempos_is_rejected() {
+        let tempo_track = |microseconds_per_quarter| {
+            vec![
+                TrackEvent {
+                    delta: 0.into(),
+                    kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(
+                        microseconds_per_quarter,
+                    ))),
+                },
+                TrackEvent {
+                    delta: 0.into(),
+                    kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                },
+            ]
+        };
+        let smf = Smf {
+            header: Header::new(Format::Sequential, Timing::Metrical(u15::from(480))),
+            tracks: vec![tempo_track(500_000), tempo_track(250_000)],
+        };
+        let mut midi = Vec::new();
+        smf.write(&mut midi).expect("write sequential SMF");
+
+        let error = convert_midi_to_tsq_vec(&midi).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Unsupported("sequential SMF tracks require independent tempo maps")
+        ));
     }
 
     #[test]
