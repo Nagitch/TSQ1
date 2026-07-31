@@ -144,7 +144,19 @@ fn sequence_from_smf(smf: &Smf<'_>) -> Result<Sequence, Error> {
         sequence.tracks.push(track);
     }
     sequence.tempo_map.sort_by_key(|entry| entry.tick);
-    sequence.tempo_map.dedup_by_key(|entry| entry.tick);
+    // The stable sort preserves source order, so replacing an equal-tick entry
+    // keeps the tempo that is effective after all events at that position.
+    let mut canonical_tempo_map: Vec<TempoEntry> = Vec::with_capacity(sequence.tempo_map.len());
+    for entry in sequence.tempo_map.drain(..) {
+        if let Some(previous) = canonical_tempo_map.last_mut() {
+            if previous.tick == entry.tick {
+                *previous = entry;
+                continue;
+            }
+        }
+        canonical_tempo_map.push(entry);
+    }
+    sequence.tempo_map = canonical_tempo_map;
     Ok(sequence)
 }
 
@@ -263,8 +275,25 @@ fn position_events<'a>(
         };
         result.push((position, index, event));
     }
-    result.sort_by_key(|(position, index, _)| (*position, *index));
+    let terminal_position = result
+        .iter()
+        .map(|(position, _, _)| *position)
+        .max()
+        .unwrap_or(0);
+    for (position, _, event) in &mut result {
+        if is_end_of_track(&event.kind) {
+            // SMF readers treat this marker as terminal, so it must not precede
+            // a later event introduced by merging the two TSQ1 time domains.
+            *position = terminal_position;
+        }
+    }
+    result
+        .sort_by_key(|(position, index, event)| (*position, is_end_of_track(&event.kind), *index));
     Ok(result)
+}
+
+fn is_end_of_track(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Meta { type_id: 0x2F, .. })
 }
 
 fn midly_kind_from_event<'a>(kind: &'a EventKind) -> Result<TrackEventKind<'a>, Error> {
@@ -1240,6 +1269,77 @@ mod tests {
         let tsq = super::convert_midi_to_tsq_vec(&midi_bytes).expect("conversion succeeds");
         let flags = u16::from_le_bytes([tsq[12], tsq[13]]);
         assert_eq!(flags & super::FLAG_SYSEX_STATUS_IN_PAYLOAD, 0);
+    }
+
+    #[test]
+    fn same_tick_tempo_map_keeps_the_later_event() {
+        let track = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(600_000))),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(400_000))),
+            },
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let smf = Smf {
+            header: Header::new(Format::SingleTrack, Timing::Metrical(u15::from(480))),
+            tracks: vec![track],
+        };
+
+        let sequence = super::sequence_from_smf(&smf).expect("conversion succeeds");
+        assert_eq!(
+            sequence.tempo_map,
+            vec![TempoEntry {
+                tick: 0,
+                microseconds_per_quarter: 400_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn mixed_domain_export_moves_end_of_track_after_the_timeline() {
+        let mut sequence = Sequence::new(480);
+        sequence.sync_anchors = vec![
+            SyncAnchor { tick: 0, time: 0 },
+            SyncAnchor {
+                tick: 960,
+                time: 1_000_000,
+            },
+        ];
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 500_000,
+                    domain: TimeDomain::Absolute,
+                    kind: EventKind::Midi([0x90, 60, 100]),
+                },
+                Event {
+                    delta: 240,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        let track = &parsed.tracks[0];
+        assert_eq!(track[0].delta.as_int(), 480);
+        assert!(matches!(track[0].kind, TrackEventKind::Midi { .. }));
+        assert_eq!(track[1].delta.as_int(), 0);
+        assert!(matches!(
+            track[1].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
     }
 
     #[test]
