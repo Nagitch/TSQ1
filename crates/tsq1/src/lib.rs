@@ -201,12 +201,57 @@ fn sequence_to_midi(sequence: &Sequence) -> Result<Vec<u8>, Error> {
         Timing::Metrical(ppq)
     };
 
-    let mut tracks = Vec::new();
-    for source_track in &sequence.tracks {
-        let positioned = position_events(sequence, source_track, use_smpte)?;
+    let reconcile_tempo_map = !use_smpte && !sequence.tempo_map.is_empty();
+    let track_count = if reconcile_tempo_map {
+        sequence.tracks.len().max(1)
+    } else {
+        sequence.tracks.len()
+    };
+    let mut tracks = Vec::with_capacity(track_count);
+    for track_index in 0..track_count {
+        let mut positioned_midi = Vec::new();
+        if let Some(source_track) = sequence.tracks.get(track_index) {
+            for (position, index, event) in position_events(sequence, source_track, use_smpte)? {
+                if reconcile_tempo_map && is_tempo_event(&event.kind) {
+                    continue;
+                }
+                let order = if is_end_of_track(&event.kind) { 2 } else { 0 };
+                positioned_midi.push((position, order, index, midly_kind_from_event(&event.kind)?));
+            }
+        }
+        if reconcile_tempo_map && track_index == 0 {
+            for (index, entry) in sequence.tempo_map.iter().enumerate() {
+                let tempo = u24::try_from(entry.microseconds_per_quarter)
+                    .ok_or(Error::Invalid("tempo out of range"))?;
+                positioned_midi.push((
+                    entry.tick,
+                    1,
+                    index,
+                    TrackEventKind::Meta(MetaMessage::Tempo(tempo)),
+                ));
+            }
+            if sequence.tracks.is_empty() {
+                positioned_midi.push((0, 2, 0, TrackEventKind::Meta(MetaMessage::EndOfTrack)));
+            }
+        }
+
+        let terminal_position = positioned_midi
+            .iter()
+            .map(|(position, _, _, _)| *position)
+            .max()
+            .unwrap_or(0);
+        for (position, _, _, kind) in &mut positioned_midi {
+            if matches!(&*kind, TrackEventKind::Meta(MetaMessage::EndOfTrack)) {
+                // SMF readers treat this marker as terminal, so it must follow
+                // both merged-domain events and synthesized tempo changes.
+                *position = terminal_position;
+            }
+        }
+        positioned_midi.sort_by_key(|(position, order, index, _)| (*position, *order, *index));
+
         let mut previous = 0u64;
         let mut track = Vec::new();
-        for (position, _, event) in positioned {
+        for (position, _, _, kind) in positioned_midi {
             let delta = position
                 .checked_sub(previous)
                 .ok_or(Error::Invalid("events are not ordered"))?;
@@ -214,10 +259,7 @@ fn sequence_to_midi(sequence: &Sequence) -> Result<Vec<u8>, Error> {
                 u32::try_from(delta).map_err(|_| Error::DataOverflow("MIDI delta exceeds u32"))?;
             let delta = u28::try_from(delta_u32)
                 .ok_or(Error::DataOverflow("MIDI delta exceeds SMF limits"))?;
-            track.push(TrackEvent {
-                delta,
-                kind: midly_kind_from_event(&event.kind)?,
-            });
+            track.push(TrackEvent { delta, kind });
             previous = position;
         }
         tracks.push(track);
@@ -275,25 +317,16 @@ fn position_events<'a>(
         };
         result.push((position, index, event));
     }
-    let terminal_position = result
-        .iter()
-        .map(|(position, _, _)| *position)
-        .max()
-        .unwrap_or(0);
-    for (position, _, event) in &mut result {
-        if is_end_of_track(&event.kind) {
-            // SMF readers treat this marker as terminal, so it must not precede
-            // a later event introduced by merging the two TSQ1 time domains.
-            *position = terminal_position;
-        }
-    }
-    result
-        .sort_by_key(|(position, index, event)| (*position, is_end_of_track(&event.kind), *index));
+    result.sort_by_key(|(position, index, _)| (*position, *index));
     Ok(result)
 }
 
 fn is_end_of_track(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Meta { type_id: 0x2F, .. })
+}
+
+fn is_tempo_event(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Meta { type_id: 0x51, .. })
 }
 
 fn midly_kind_from_event<'a>(kind: &'a EventKind) -> Result<TrackEventKind<'a>, Error> {
@@ -1306,6 +1339,123 @@ mod tests {
                 microseconds_per_quarter: 400_000,
             }]
         );
+    }
+
+    #[test]
+    fn metrical_export_synthesizes_the_canonical_tempo_map() {
+        let mut sequence = Sequence::new(480);
+        sequence.tempo_map = vec![
+            TempoEntry {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            },
+            TempoEntry {
+                tick: 480,
+                microseconds_per_quarter: 400_000,
+            },
+        ];
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 240,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Midi([0x90, 60, 100]),
+                },
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        let track = &parsed.tracks[0];
+        assert_eq!(track.len(), 4);
+        assert_eq!(track[0].delta.as_int(), 0);
+        assert!(matches!(
+            track[0].kind,
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) if value.as_int() == 500_000
+        ));
+        assert_eq!(track[1].delta.as_int(), 240);
+        assert!(matches!(track[1].kind, TrackEventKind::Midi { .. }));
+        assert_eq!(track[2].delta.as_int(), 240);
+        assert!(matches!(
+            track[2].kind,
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) if value.as_int() == 400_000
+        ));
+        assert_eq!(track[3].delta.as_int(), 0);
+        assert!(matches!(
+            track[3].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+    }
+
+    #[test]
+    fn canonical_tempo_map_replaces_redundant_track_events() {
+        let mut sequence = Sequence::new(480);
+        sequence.tempo_map.push(TempoEntry {
+            tick: 0,
+            microseconds_per_quarter: 500_000,
+        });
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x51,
+                        data: vec![0x09, 0x27, 0xC0],
+                    },
+                },
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        assert_eq!(parsed.tracks[0].len(), 2);
+        assert!(matches!(
+            parsed.tracks[0][0].kind,
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) if value.as_int() == 500_000
+        ));
+        assert!(matches!(
+            parsed.tracks[0][1].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+    }
+
+    #[test]
+    fn tempo_only_sequence_exports_a_conductor_track() {
+        let mut sequence = Sequence::new(480);
+        sequence.tempo_map.push(TempoEntry {
+            tick: 0,
+            microseconds_per_quarter: 500_000,
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(parsed.tracks[0].len(), 2);
+        assert!(matches!(
+            parsed.tracks[0][0].kind,
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) if value.as_int() == 500_000
+        ));
+        assert!(matches!(
+            parsed.tracks[0][1].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
     }
 
     #[test]
