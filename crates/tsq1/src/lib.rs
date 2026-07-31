@@ -611,17 +611,19 @@ fn meta_from_payload<'a>(ty: u8, data: &'a [u8]) -> Result<MetaMessage<'a>, Erro
         0x08 => ProgramName(data),
         0x09 => DeviceName(data),
         0x20 => {
-            let channel = *data
-                .first()
-                .ok_or(Error::Invalid("missing MIDI channel value"))?;
+            if data.len() != 1 {
+                return Err(Error::Invalid("MIDI channel meta must be 1 byte"));
+            }
+            let channel = data[0];
             let channel =
                 u4::try_from(channel).ok_or(Error::Invalid("MIDI channel out of range"))?;
             MidiChannel(channel)
         }
         0x21 => {
-            let port = *data
-                .first()
-                .ok_or(Error::Invalid("missing MIDI port value"))?;
+            if data.len() != 1 {
+                return Err(Error::Invalid("MIDI port meta must be 1 byte"));
+            }
+            let port = data[0];
             let port = u7::try_from(port).ok_or(Error::Invalid("MIDI port out of range"))?;
             MidiPort(port)
         }
@@ -1340,6 +1342,29 @@ mod tests {
             track[1].kind,
             TrackEventKind::Meta(MetaMessage::EndOfTrack)
         ));
+    }
+
+    #[test]
+    fn fixed_width_channel_and_port_meta_reject_extra_bytes() {
+        for (type_id, expected) in [
+            (0x20, "MIDI channel meta must be 1 byte"),
+            (0x21, "MIDI port meta must be 1 byte"),
+        ] {
+            let mut sequence = Sequence::new(480);
+            sequence.tracks.push(Track {
+                events: vec![Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id,
+                        data: vec![1, 2],
+                    },
+                }],
+            });
+
+            let error = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).unwrap_err();
+            assert!(matches!(error, Error::Invalid(message) if message == expected));
+        }
     }
 
     #[test]
