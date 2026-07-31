@@ -206,25 +206,32 @@ fn sequence_to_midi(sequence: &Sequence) -> Result<Vec<u8>, Error> {
         Timing::Metrical(ppq)
     };
 
-    let reconcile_tempo_map = !use_smpte && !sequence.tempo_map.is_empty();
-    let track_count = if reconcile_tempo_map {
-        sequence.tracks.len().max(1)
-    } else {
-        sequence.tracks.len()
-    };
+    // In metrical mode TMAP is authoritative even when empty: clearing it must
+    // remove redundant track-level tempo events instead of reviving them.
+    let use_canonical_tempo_map = !use_smpte;
+    let track_count = sequence.tracks.len().max(1);
     let mut tracks = Vec::with_capacity(track_count);
     for track_index in 0..track_count {
         let mut positioned_midi = Vec::new();
+        let mut source_eot_position = None;
         if let Some(source_track) = sequence.tracks.get(track_index) {
             for (position, index, event) in position_events(sequence, source_track, use_smpte)? {
-                if reconcile_tempo_map && is_tempo_event(&event.kind) {
+                if is_end_of_track(&event.kind) {
+                    let _ = midly_kind_from_event(&event.kind)?;
+                    source_eot_position = Some(
+                        source_eot_position
+                            .map_or(position, |previous: u64| previous.max(position)),
+                    );
                     continue;
                 }
-                let order = if is_end_of_track(&event.kind) { 2 } else { 0 };
-                positioned_midi.push((position, order, index, midly_kind_from_event(&event.kind)?));
+                if use_canonical_tempo_map && is_tempo_event(&event.kind) {
+                    let _ = midly_kind_from_event(&event.kind)?;
+                    continue;
+                }
+                positioned_midi.push((position, 0, index, midly_kind_from_event(&event.kind)?));
             }
         }
-        if reconcile_tempo_map && track_index == 0 {
+        if use_canonical_tempo_map && track_index == 0 {
             for (index, entry) in sequence.tempo_map.iter().enumerate() {
                 let tempo = u24::try_from(entry.microseconds_per_quarter)
                     .ok_or(Error::Invalid("tempo out of range"))?;
@@ -235,23 +242,22 @@ fn sequence_to_midi(sequence: &Sequence) -> Result<Vec<u8>, Error> {
                     TrackEventKind::Meta(MetaMessage::Tempo(tempo)),
                 ));
             }
-            if sequence.tracks.is_empty() {
-                positioned_midi.push((0, 2, 0, TrackEventKind::Meta(MetaMessage::EndOfTrack)));
-            }
         }
 
         let terminal_position = positioned_midi
             .iter()
             .map(|(position, _, _, _)| *position)
             .max()
-            .unwrap_or(0);
-        for (position, _, _, kind) in &mut positioned_midi {
-            if matches!(&*kind, TrackEventKind::Meta(MetaMessage::EndOfTrack)) {
-                // SMF readers treat this marker as terminal, so it must follow
-                // both merged-domain events and synthesized tempo changes.
-                *position = terminal_position;
-            }
-        }
+            .unwrap_or(0)
+            .max(source_eot_position.unwrap_or(0));
+        // SMF requires exactly one terminal marker per track. Preserve a later
+        // source EOT position while also following merged and synthesized events.
+        positioned_midi.push((
+            terminal_position,
+            2,
+            0,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        ));
         positioned_midi.sort_by_key(|(position, order, index, _)| (*position, *order, *index));
 
         let mut previous = 0u64;
@@ -1469,6 +1475,96 @@ mod tests {
             parsed.tracks[0][1].kind,
             TrackEventKind::Meta(MetaMessage::EndOfTrack)
         ));
+    }
+
+    #[test]
+    fn clearing_the_canonical_tempo_map_removes_redundant_track_tempos() {
+        let mut sequence = Sequence::new(480);
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x51,
+                        data: vec![0x07, 0xA1, 0x20],
+                    },
+                },
+                Event {
+                    delta: 0,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        assert_eq!(parsed.tracks[0].len(), 1);
+        assert!(matches!(
+            parsed.tracks[0][0].kind,
+            TrackEventKind::Meta(MetaMessage::EndOfTrack)
+        ));
+    }
+
+    #[test]
+    fn every_exported_track_has_exactly_one_terminal_end_of_track() {
+        let mut sequence = Sequence::new(480);
+        sequence.tracks.push(Track::default());
+        sequence.tracks.push(Track {
+            events: vec![Event {
+                delta: 120,
+                domain: TimeDomain::Musical,
+                kind: EventKind::Midi([0x90, 60, 100]),
+            }],
+        });
+        sequence.tracks.push(Track {
+            events: vec![
+                Event {
+                    delta: 240,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+                Event {
+                    delta: 120,
+                    domain: TimeDomain::Musical,
+                    kind: EventKind::Meta {
+                        type_id: 0x2F,
+                        data: Vec::new(),
+                    },
+                },
+            ],
+        });
+
+        let midi = convert_tsq_to_midi_vec(&sequence.encode().unwrap()).expect("convert");
+        let parsed = Smf::parse(&midi).expect("parse");
+        assert_eq!(parsed.tracks.len(), 3);
+        for track in &parsed.tracks {
+            assert!(matches!(
+                track.last().expect("track has EOT").kind,
+                TrackEventKind::Meta(MetaMessage::EndOfTrack)
+            ));
+            assert_eq!(
+                track
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        TrackEventKind::Meta(MetaMessage::EndOfTrack)
+                    ))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(parsed.tracks[0][0].delta.as_int(), 0);
+        assert_eq!(parsed.tracks[1][0].delta.as_int(), 120);
+        assert_eq!(parsed.tracks[1][1].delta.as_int(), 0);
+        assert_eq!(parsed.tracks[2][0].delta.as_int(), 360);
     }
 
     #[test]
