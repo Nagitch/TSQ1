@@ -6,12 +6,12 @@
 
 **TSQ1 (Time Sequence Quantized)** is a compact binary format for discrete
 events on musical and absolute timelines. The repository contains the draft
-format specification, a Rust conversion library, and a command-line tool.
+format specification, Rust libraries, a command-line tool, and a VS Code
+editor.
 
-The current implementation converts Standard MIDI Files (SMF) to and from the
-musical-time subset of TSQ1. The draft format is broader than the implemented
-subset; see [Implementation status](#implementation-status) before integrating
-it.
+The repository implements the complete v1 draft data model in Rust and
+TypeScript, SMF interoperability, OSC helpers, a command-line toolkit, and a
+VS Code binary custom editor.
 
 ## Format overview
 
@@ -30,19 +30,24 @@ Read the detailed draft specification in
 
 ## Implementation status
 
-Implemented:
+Implemented and covered by shared compatibility tests:
 
-- SMF-to-TSQ1 and TSQ1-to-SMF conversion for PPQ-based musical timing
-- MIDI channel, meta, SysEx, and escape events covered by the test suite
-- `no_std` library builds with allocation support
-- C-compatible SMF-to-TSQ1 conversion and buffer release functions
+- Musical and absolute event domains with checked `SYNC` interpolation
+- MIDI, meta, SysEx/escape, RAW OSC, MessagePack OSC, CBOR payload storage,
+  and custom events
+- `TMAP`, `SYNC`, `MARK`, `SMPF`, and byte-preserving unknown chunks
+- SMF import/export for metrical and SMPTE divisions (24, 25, 29.97
+  drop-frame, and 30 fps)
+- Owned `Sequence` decode, validate, edit, and canonical encode APIs
+- `osc-ir` MessagePack interoperability through the `tsq1-osc` crate
+- CLI conversion, JSON inspection, and byte-offset-aware validation
+- VS Code binary custom editor with undo/redo, save, save-as, revert, backup,
+  diagnostics, all event kinds, and installable VSIX packaging
+- Allocation-backed `no_std` core and C-compatible conversion functions
 
-Not yet implemented:
-
-- Absolute-time events
-- Custom events
-- General OSC event conversion
-- SMPTE timecode input
+SMF cannot represent OSC or custom events. Export therefore reports an error
+instead of silently dropping them. Absolute events require either `SYNC`
+anchors or retained SMPTE source timing when exported to SMF.
 
 The specification remains a draft. Compatibility-sensitive consumers should
 pin a commit until a stable format version is released.
@@ -51,12 +56,15 @@ pin a commit until a stable format version is released.
 
 ```text
 .
-├── crates/tsq1/       # reusable Rust library
-├── crates/tsq1-ffi/   # C-compatible dynamic library
-├── tests/no-std/      # compile-only no-std integration check
-├── tools/tsq1-cli/    # SMF/TSQ1 command-line converter
-├── .github/           # CI and contribution automation
-└── TSQ1_SPEC_*.md     # English and Japanese draft specifications
+├── crates/tsq1/         # reusable Rust library
+├── crates/tsq1-ffi/     # C-compatible dynamic library
+├── crates/tsq1-osc/     # osc-ir / MessagePack interoperability
+├── editors/vscode-tsq1/ # VS Code binary custom editor
+├── tests/no-std/        # compile-only no-std integration check
+├── tests/fixtures/      # shared Rust/TypeScript canonical files
+├── tools/tsq1-cli/      # SMF/TSQ1 command-line converter
+├── .github/             # CI and contribution automation
+└── TSQ1_SPEC_*.md       # English and Japanese draft specifications
 ```
 
 ## Getting started
@@ -79,6 +87,13 @@ cargo run -p tsq1-cli -- input.tsq --direction tsq-to-midi
 Use an explicit output path with `--output path/to/output.tsq`. Run
 `cargo run -p tsq1-cli -- --help` for the complete CLI reference.
 
+Inspect or validate the complete binary model:
+
+```console
+cargo run -p tsq1-cli -- inspect input.tsq
+cargo run -p tsq1-cli -- validate input.tsq
+```
+
 Library consumers can call the byte-oriented API directly:
 
 ```rust
@@ -90,7 +105,16 @@ let roundtrip_midi = tsq1::convert_tsq_to_midi_vec(&tsq)?;
 
 See the [library crate](crates/tsq1/README.md) and
 [CLI tool](tools/tsq1-cli/README.md) documentation for component-specific
-details.
+details. To build the editor:
+
+```console
+cd editors/vscode-tsq1
+npm ci
+npm run vsix
+```
+
+Install `editors/vscode-tsq1/dist/tsq1-editor.vsix` from VS Code's
+**Extensions: Install from VSIX...** command.
 
 ## Development
 
@@ -102,6 +126,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo check -p tsq1-no-std-check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cd editors/vscode-tsq1
+npm ci
+npm run package
 ```
 
 Dependency update PRs are created by Dependabot. See

@@ -23,7 +23,16 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 | 0x08 | 1 | `u8` | AbsUnit | 0 = Microseconds, 1 = Nanoseconds |
 | 0x09 | 1 | - | Reserved | 0 固定 |
 | 0x0A | 2 | `u16` | TrackCount | トラック数の目安（参考値） |
-| 0x0C | 2 | `u16` | Flags | 将来予約（0） |
+| 0x0C | 2 | `u16` | Flags | 下記のエンコードフラグ |
+
+ヘッダフラグ：
+
+- `bit 0`（`0x0001`）：SysEx ペイロードに先頭の `0xF0` または
+  `0xF7` ステータスバイトを含む。
+- `bit 1`（`0x0002`）：MIDI メッセージが正準の 3 バイト固定形式。
+  本ドラフトの Writer はこのビットをセットする。
+- その他のビットは予約。Reader は未知ビットを無視し、ファイルを
+  再書き込みする場合は保持する。
 
 ---
 
@@ -35,8 +44,11 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 - `"TMAP"`: テンポマップエントリ群 `(tick:u64, us_per_qn:u32)*`
 - `"SYNC"`: 絶対アンカー群 `(tick:u64, time_abs:u64)*`（`time_abs` は `AbsUnit` に従う）
 - `"MARK"`: アレンジ用ロケーター／マーカー
+- `"SMPF"`: 元の SMF SMPTE division `[fps:u8][subframes:u8]`
 
-実装は追加チャンクを導入可能です。未知のチャンク ID は `ChunkLength` に基づいてスキップしてください。
+実装は追加チャンクを導入可能です。未知のチャンク ID は
+`ChunkLength` に基づいてスキップしてください。可逆エディタは未知
+チャンクをバイト単位で保持するべきです。
 
 ---
 
@@ -70,7 +82,8 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
   - `0x01 = MSGPACK`: `{ "k": "msg"|"bun", "p": "/foo", "t": ",ifs", "a": [...], "ntp": u64? }`
   - `0x02 = CBOR`: 上記スキーマを CBOR で表現
   - `0x20–0x7F`: 予約
-- RAW の検証ガイドライン：先頭バイト `'/'` または `'#'`、必要に応じて 4 バイトアラインメント
+- RAW の検証：先頭バイトは `'/'` または `'#'`、packet 長は 4 バイト
+  アラインメント
 - 発火時間は `Header.Domain` と `ΔTime` から導出。ペイロード内 timetag は変更しない
 - 断片化不可：1 TSQ1 イベント = 1 OSC メッセージ／バンドル
 
@@ -78,7 +91,10 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 ```
 [Status:1][Data1:1][Data2:1]
 ```
-- Running Status は使用しない。常に 3 バイトを格納
+- Running Status は使用せず、正準形式では常に 3 バイトを格納。
+- Program Change（`0xCn`）と Channel Pressure（`0xDn`）の `Data2` は 0。
+- 後方互換のため、ヘッダフラグ `0x0002` がない場合は `0xCn` / `0xDn`
+  の 2 バイト形式を受理してよい。
 
 ### 4.3 Meta（`EventKind = 0x02`）
 ```
@@ -88,8 +104,13 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 
 ### 4.4 SysEx（`EventKind = 0x03`）
 ```
-[Length:VLQ][Data:N]  // 0xF0/0xF7 は含めない
+[Length:VLQ][Data:N]
 ```
+- ヘッダフラグ `0x0001` がある場合、`Data` の先頭に `0xF0` または
+  `0xF7` を含め、`Length` にも算入する。正準 Writer は escape /
+  continuation を可逆にするためこの形式を使う。
+- フラグがない従来形式では framing を含まず、Reader は `0xF0` と
+  みなす。
 
 ### 4.5 Custom（`EventKind = 0x7E`）
 ```
@@ -99,7 +120,16 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 
 ---
 
-## 5. SYNC チャンク
+## 5. タイミングチャンク
+
+### 5.1 TMAP
+```
+"TMAP"[len:u32] { [tick:u64][us_per_qn:u32] }*
+```
+- `tick` は厳密な昇順。
+- `us_per_qn` は SMF tempo metadata と同じ四分音符あたりの μs。
+
+### 5.2 SYNC
 ```
 "SYNC"[len:u32] { [tick:u64][time_abs:u64] }*
 ```
@@ -107,12 +137,23 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
 - `time_abs`: `AbsUnit` に基づく絶対位置
 - アンカー間の線形補間により tick ↔ time 変換を提供
 - `time_abs` はシーケンス経過時間であり、実世界の時計時刻ではない
+- `tick` と `time_abs` はどちらも厳密な昇順。
+
+### 5.3 SMPF
+```
+"SMPF"[len=2:u32][fps:u8][subframes:u8]
+```
+- SMF へ可逆出力するため、入力元の SMPTE division を保持。
+- `fps` は `24`、`25`、`29`（29.97 drop-frame）、`30`。
+- `subframes` は 0 より大きい値。
+- SMPTE 入力のトラックdeltaは Absolute ドメインで表現し、`SMPF` が
+  元の division の復元方法を記録する。
 
 ---
 
 ## 6. MARK チャンク（ロケーター）
 ```
-"MARK"[len:u32] { [pos_kind:u8][pos:u64][name_len:VLQ][name:N][class:u8][color_rgba:u32]? }*
+"MARK"[len:u32] { [pos_kind:u8][pos:u64][name_len:VLQ][name:N][class:u8][marker_flags:u8][color_rgba:u32]? }*
 ```
 - 目的：演奏や制御に影響しないナビゲーション用メタデータを格納（Ableton Live のロケーター等）。
 - 位置指定：
@@ -127,7 +168,8 @@ TSQ1（Time Sequence Quantized）は、音楽イベントと制御イベント�
     - `0x20 = Cue`
     - `0x7F = Custom`
 - 色（任意）：
-  - `color_rgba` は任意。`class` と独立に付与可能。
+  - `marker_flags.bit0 = 1` のとき `color_rgba` が存在する。その他の
+    marker flag は予約であり 0 とする。
   - リトルエンディアン `u32` RGBA（`0xAARRGGBB`）。未対応の実装は無視してよい。
 - 並び順：同一 `pos_kind` 内では `pos` 昇順。
 - 一意性：同一位置の複数ロケーターを許容。
@@ -144,6 +186,7 @@ pos      = 1024  // 開始からの tick
 name_len = VLQ(len("Generic Marker"))
 name     = "Generic Marker"
 class    = 0x00  // Generic
+marker_flags = 0x00
 
 // Absolute：90 秒に "Cue" を配置（色は任意）
 pos_kind   = 1  // Absolute
@@ -151,6 +194,7 @@ pos        = 90_000_000  // AbsUnit=μs の例
 name_len   = VLQ(len("Cue"))
 name       = "Cue"
 class      = 0x20  // Cue
+marker_flags = 0x01
 color_rgba = 0xFF00FF00  // 任意：不透明グリーン
 ```
 
@@ -168,17 +212,17 @@ color_rgba = 0xFF00FF00  // 任意：不透明グリーン
 ### 8.1 Musical で 240 tick 後に OSC RAW を送出
 ```
 Header = 0b0_0000000 (Domain = Musical, Kind = OSC)
-ΔTime  = 0x81 0x10  // 240
+ΔTime  = 0x81 0x70  // 240
 Payload:
   OscFormat = 0x00  // RAW
-  Length    = 0x15
-  Data      = "/light/flash\0\0\0,i\0\0\0\0\0\1"
+  Length    = 0x18
+  Data      = address "/light/flash"、type tag ",i"、引数 1 の OSC packet
 ```
 
 ### 8.2 Absolute で 150,000 μs 後に MIDI Note On
 ```
 Header = 0b1_0000001 (Domain = Absolute, Kind = MIDI)
-ΔTime  = 0x83 0x58  // 150,000 (μs)
+ΔTime  = 0x89 0x93 0x70  // 150,000 (μs)
 Payload: [0x90, 0x3C, 0x64]
 ```
 

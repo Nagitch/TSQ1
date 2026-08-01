@@ -58,6 +58,8 @@ build/
 dist/
 out/
 target/
+node_modules/
+*.vsix
 
 # IDE files
 .vscode/

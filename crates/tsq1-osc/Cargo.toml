@@ -1,0 +1,18 @@
+[package]
+name = "tsq1-osc"
+description = "OSC intermediate-representation integration for TSQ1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+
+[dependencies]
+osc-codec-msgpack.workspace = true
+osc-ir.workspace = true
+tsq1 = { path = "../tsq1" }
+
+[lints]
+workspace = true

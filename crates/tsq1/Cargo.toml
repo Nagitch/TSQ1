@@ -17,9 +17,11 @@ crate-type = ["rlib"]
 [features]
 default = ["std"]
 std = []
+serde = ["dep:serde"]
 
 [dependencies]
 midly.workspace = true
+serde = { workspace = true, optional = true }
 
 [lints]
 workspace = true
