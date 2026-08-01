@@ -75,6 +75,7 @@ export interface Sequence {
 export interface DocumentState {
   model: Sequence | null;
   error: string | null;
+  revision: number;
 }
 
 const MAX_U64 = (1n << 64n) - 1n;

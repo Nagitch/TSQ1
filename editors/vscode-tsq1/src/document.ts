@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import { decodeSequence, encodeSequence } from "./codec.js";
 import { emptySequence, type DocumentState, type Sequence } from "./model.js";
+import { assertDocumentRevision, nextDocumentRevision } from "./revision.js";
 
 interface Snapshot {
   bytes: Uint8Array;
@@ -28,7 +29,7 @@ export class TsqDocument implements vscode.CustomDocument {
       const model = emptySequence();
       return new TsqDocument(uri, {
         bytes: encodeSequence(model),
-        state: { model, error: null },
+        state: { model, error: null, revision: 0 },
       });
     }
     const source = backupId === undefined ? uri : vscode.Uri.parse(backupId);
@@ -44,12 +45,31 @@ export class TsqDocument implements vscode.CustomDocument {
     return this.current.bytes.slice();
   }
 
-  applyModel(model: Sequence): void {
+  applyModel(model: Sequence, expectedRevision: number): void {
+    assertDocumentRevision(expectedRevision, this.current.state.revision);
+    this.commitModel(model);
+  }
+
+  editModel(expectedRevision: number, edit: (model: Sequence) => void): void {
+    assertDocumentRevision(expectedRevision, this.current.state.revision);
+    const model = cloneState(this.current.state).model;
+    if (model === null) {
+      throw new Error("document has no editable sequence model");
+    }
+    edit(model);
+    this.commitModel(model);
+  }
+
+  private commitModel(model: Sequence): void {
     const bytes = encodeSequence(model);
     const before = cloneSnapshot(this.current);
     const after: Snapshot = {
       bytes,
-      state: { model: decodeSequence(bytes), error: null },
+      state: {
+        model: decodeSequence(bytes),
+        error: null,
+        revision: this.current.state.revision,
+      },
     };
     this.restore(after);
     this.editEmitter.fire({
@@ -97,7 +117,9 @@ export class TsqDocument implements vscode.CustomDocument {
   }
 
   private restore(snapshot: Snapshot): void {
+    const revision = nextDocumentRevision(this.current.state.revision);
     this.current = cloneSnapshot(snapshot);
+    this.current.state.revision = revision;
     this.changeEmitter.fire(this.state);
   }
 }
@@ -107,7 +129,7 @@ function snapshotFromBytes(bytes: Uint8Array): Snapshot {
   try {
     return {
       bytes: owned,
-      state: { model: decodeSequence(owned), error: null },
+      state: { model: decodeSequence(owned), error: null, revision: 0 },
     };
   } catch (error) {
     return {
@@ -115,6 +137,7 @@ function snapshotFromBytes(bytes: Uint8Array): Snapshot {
       state: {
         model: null,
         error: error instanceof Error ? error.message : String(error),
+        revision: 0,
       },
     };
   }

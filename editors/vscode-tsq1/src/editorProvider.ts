@@ -5,11 +5,12 @@ import * as vscode from "vscode";
 import { TsqDocument } from "./document.js";
 import { removeEventPreservingTimeline } from "./model.js";
 import type { DocumentState, Sequence } from "./model.js";
+import { StaleDocumentRevisionError } from "./revision.js";
 
 type WebviewMessage =
   | { type: "ready" }
-  | { type: "apply"; model: Sequence }
-  | { type: "removeEvent"; trackIndex: number; eventIndex: number };
+  | { type: "apply"; model: Sequence; revision: number }
+  | { type: "removeEvent"; trackIndex: number; eventIndex: number; revision: number };
 
 export class TsqEditorProvider implements vscode.CustomEditorProvider<TsqDocument> {
   private readonly editEmitter =
@@ -58,18 +59,21 @@ export class TsqEditorProvider implements vscode.CustomEditorProvider<TsqDocumen
       }
       try {
         if (message.type === "apply") {
-          document.applyModel(message.model);
+          document.applyModel(message.model, message.revision);
         } else {
-          const model = document.state.model;
-          const track = model?.tracks[message.trackIndex];
-          if (model === null || model === undefined || track === undefined) {
-            throw new RangeError("track index is outside the sequence");
-          }
-          removeEventPreservingTimeline(track, message.eventIndex);
-          document.applyModel(model);
+          document.editModel(message.revision, (model) => {
+            const track = model.tracks[message.trackIndex];
+            if (track === undefined) {
+              throw new RangeError("track index is outside the sequence");
+            }
+            removeEventPreservingTimeline(track, message.eventIndex);
+          });
         }
         await panel.webview.postMessage({ type: "status", message: "Changes applied" });
       } catch (error) {
+        if (error instanceof StaleDocumentRevisionError) {
+          await panel.webview.postMessage({ type: "state", state: document.state });
+        }
         await panel.webview.postMessage({
           type: "diagnostic",
           message: error instanceof Error ? error.message : String(error),
@@ -333,7 +337,12 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
           remove.textContent = "Remove";
           remove.addEventListener("click", () => {
             showDiagnostic("");
-            vscode.postMessage({ type: "removeEvent", trackIndex, eventIndex });
+            vscode.postMessage({
+              type: "removeEvent",
+              trackIndex,
+              eventIndex,
+              revision: state.revision
+            });
           });
           action.append(remove);
           row.append(action);
@@ -346,7 +355,7 @@ function renderEditorHtml(webview: vscode.Webview, state: DocumentState): string
 
     function submitModel(model) {
       showDiagnostic("");
-      vscode.postMessage({ type: "apply", model });
+      vscode.postMessage({ type: "apply", model, revision: state.revision });
     }
 
     document.getElementById("apply").addEventListener("click", () => {

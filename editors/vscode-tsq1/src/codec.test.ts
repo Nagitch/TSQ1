@@ -5,6 +5,11 @@ import test from "node:test";
 
 import { decodeSequence, encodeSequence, FormatError } from "./codec.js";
 import { emptySequence, removeEventPreservingTimeline, type Track } from "./model.js";
+import {
+  assertDocumentRevision,
+  nextDocumentRevision,
+  StaleDocumentRevisionError,
+} from "./revision.js";
 
 function fixtureBytes(): Uint8Array {
   const fixture = readFileSync(
@@ -90,6 +95,20 @@ void test("event removal is transactional when the carried delta overflows u64",
 
   assert.throws(() => removeEventPreservingTimeline(track, 0), /exceeds u64/);
   assert.deepEqual(track, before);
+});
+
+void test("stale editor revisions are rejected and revisions never move backward", () => {
+  assert.doesNotThrow(() => assertDocumentRevision(4, 4));
+  assert.throws(
+    () => assertDocumentRevision(3, 4),
+    (error) =>
+      error instanceof StaleDocumentRevisionError &&
+      error.expected === 3 &&
+      error.actual === 4,
+  );
+  assert.throws(() => assertDocumentRevision(Number.NaN, 4), StaleDocumentRevisionError);
+  assert.equal(nextDocumentRevision(4), 5);
+  assert.throws(() => nextDocumentRevision(Number.MAX_SAFE_INTEGER), /cannot be advanced safely/);
 });
 
 void test("malformed input reports a byte offset", () => {
