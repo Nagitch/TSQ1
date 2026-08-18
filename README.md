@@ -27,6 +27,8 @@ VS Code binary custom editor.
 Read the detailed draft specification in
 [English](TSQ1_SPEC_v1.0_Draft.md) or
 [日本語](TSQ1_SPEC_v1.0_Draft_JA.md).
+The rationale for cross-cutting format and implementation choices is recorded
+in the [architecture decision records](docs/adr/README.md).
 
 ## Implementation status
 
