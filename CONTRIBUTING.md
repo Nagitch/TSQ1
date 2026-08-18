@@ -2,6 +2,8 @@
 
 Thank you for improving TSQ1. Keep changes focused and preserve the distinction
 between the draft format specification and the currently implemented subset.
+Changes to an accepted format-level or cross-implementation decision must add
+or supersede an [architecture decision record](docs/adr/README.md).
 
 ## Before opening a pull request
 
