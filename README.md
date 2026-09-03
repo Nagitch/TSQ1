@@ -46,6 +46,7 @@ Implemented and covered by shared compatibility tests:
 - VS Code binary custom editor with undo/redo, save, save-as, revert, backup,
   diagnostics, all event kinds, and installable VSIX packaging
 - Allocation-backed `no_std` core and C-compatible conversion functions
+- Version-pinned, `no_std` shared calculation-kernel adapter for runtime queries
 
 SMF cannot represent OSC or custom events. Export therefore reports an error
 instead of silently dropping them. Absolute events require either `SYNC`

@@ -2,4 +2,7 @@
 
 #![no_std]
 
-pub use tsq1::{convert_midi_to_tsq_vec, convert_tsq_to_midi_vec, Error};
+pub use tsq1::{
+    calculation::{Argument, CalculationKernel, Value},
+    convert_midi_to_tsq_vec, convert_tsq_to_midi_vec, Error,
+};

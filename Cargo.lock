@@ -129,6 +129,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -154,6 +160,14 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openformula-kernel"
+version = "0.1.0"
+source = "git+https://github.com/Nagitch/openformula-kernel.git?rev=5448dcf6d130e4355da15aeed6c88e56a9a15673#5448dcf6d130e4355da15aeed6c88e56a9a15673"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "osc-codec-msgpack"
@@ -288,6 +302,7 @@ name = "tsq1"
 version = "0.1.0"
 dependencies = [
  "midly",
+ "openformula-kernel",
  "serde",
 ]
 
