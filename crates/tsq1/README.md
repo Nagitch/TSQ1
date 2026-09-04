@@ -26,6 +26,12 @@ library, while [`tsq1-osc`](../tsq1-osc/README.md) connects OSC events to
 cargo check -p tsq1-no-std-check
 ```
 
+The `calculation` module provides the version-pinned `openformula-kernel`
+boundary for query/runtime consumers. It exposes typed scalar arguments,
+standard function evaluation, compatibility metadata, and namespaced extension
+registration while leaving timeline references and persistence in TSQ1. The
+adapter remains available with `--no-default-features`.
+
 The complete draft format is documented in the
 [English specification](../../TSQ1_SPEC_v1.0_Draft.md) and
 [Japanese specification](../../TSQ1_SPEC_v1.0_Draft_JA.md).

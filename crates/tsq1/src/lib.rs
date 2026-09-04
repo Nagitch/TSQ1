@@ -21,6 +21,7 @@ use midly::{
     TrackEventKind,
 };
 
+pub mod calculation;
 mod model;
 
 pub use model::{

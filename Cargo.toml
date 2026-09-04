@@ -20,6 +20,7 @@ publish = false
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 midly = { version = "0.5.3", default-features = false, features = ["alloc"] }
+openformula-kernel = { git = "https://github.com/Nagitch/openformula-kernel.git", rev = "5448dcf6d130e4355da15aeed6c88e56a9a15673", default-features = false }
 osc-codec-msgpack = "0.1.0-alpha.1"
 osc-ir = { version = "0.1.0-alpha.1", features = ["osc11", "serde"] }
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
