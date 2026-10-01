@@ -29,6 +29,13 @@ updates:
 
   - package-ecosystem: npm
     directory: /editors/vscode-tsq1
+    # typescript-eslint 8.70 supports TypeScript <6.1. Revisit when its peer range expands.
+    ignore:
+      # Keep the API types compatible with engines.vscode.
+      - dependency-name: "@types/vscode"
+        versions: [">=1.126.0"]
+      - dependency-name: typescript
+        versions: [">=6.1"]
     schedule:
       interval: weekly
       day: monday
