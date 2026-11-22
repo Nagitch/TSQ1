@@ -6,13 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 readme = "README.md"
 
 [dependencies]
 osc-codec-msgpack.workspace = true
 osc-ir.workspace = true
-tsq1 = { path = "../tsq1" }
+tsq1 = { version = "0.1.0", path = "../tsq1" }
 
 [lints]
 workspace = true

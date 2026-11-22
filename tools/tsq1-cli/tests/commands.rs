@@ -11,7 +11,7 @@ fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
 }
 
 fn canonical_fixture() -> Vec<u8> {
-    let compact: String = include_str!("../../../tests/fixtures/full-featured.tsq.hex")
+    let compact: String = include_str!("fixtures/full-featured.tsq.hex")
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
