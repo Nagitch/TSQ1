@@ -139,9 +139,7 @@ fn decode_hex(input: &str) -> Vec<u8> {
 fn shared_full_format_fixture_is_canonical() {
     let sequence = full_featured_sequence();
     let encoded = sequence.encode().expect("complete sequence encodes");
-    let expected = decode_hex(include_str!(
-        "../../../tests/fixtures/full-featured.tsq.hex"
-    ));
+    let expected = decode_hex(include_str!("fixtures/full-featured.tsq.hex"));
     assert_eq!(
         encoded,
         expected,

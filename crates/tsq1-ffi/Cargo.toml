@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 readme = "README.md"
 
 [lib]
@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
-tsq1-core = { package = "tsq1", path = "../tsq1" }
+tsq1-core = { version = "0.1.0", package = "tsq1", path = "../tsq1" }
 
 [lints]
 workspace = true
